@@ -39,6 +39,8 @@ static int g_corner_rx = 0;
 static int g_corner_rz = 1;
 static uint64_t g_base_feed_delta = 16;
 static int g_test_mode;
+static int g_regions_mode;
+static int g_regions_total;
 
 // ----- Required fortress start offsets (the nextInt(8) x/z draws) -----
 // g_pin_x[d] / g_pin_z[d] in 0..7 pins that region's offset to exactly that value
@@ -231,6 +233,38 @@ static void vec_push(EntryVec *v, LEntry e)
         v->cap = nc;
     }
     v->data[v->count++] = e;
+}
+
+static int valid_rx(int rx)
+{
+    return ((rx & 7) == 3) || ((rx & 15) == 7);
+}
+
+static int valid_rz(int rz)
+{
+    return (rz & 31) == 31;
+}
+
+static int valid_corner(int rx, int rz)
+{
+    return valid_rx(rx) && valid_rz(rz);
+}
+
+static void reset_global_flags(void)
+{
+    g_stop_requested = 0;
+    atomic_store_explicit(&g_phase, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_p1_next, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_p2_next, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_p1_done, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_p2_done, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_mitm_seeds, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_total_evals, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_selfcheck_fail, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_test_queries, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_test_matches, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_test_lookup_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_test_fortress_ns, 0, memory_order_relaxed);
 }
 
 // ----- Setup and exact L-side math -----
@@ -950,7 +984,7 @@ static void *monitor_thread(void *arg)
 static void print_usage(const char *argv0)
 {
     printf("Usage: %s [--lut-bits N] [--threads N] [--corner-rx N] [--corner-rz N]\n", argv0);
-    printf("          [--pin D X Z]... [--no-pin] [--test]\n");
+    printf("          [--pin D X Z]... [--no-pin] [--regions N] [--test]\n");
     printf("       %s N THREADS        (legacy positional form)\n\n", argv0);
     printf("  --lut-bits, -b N   Number of LOW bits placed in the MITM LUT [20..32].\n");
     printf("                     Larger N = larger RAM LUT, smaller H scan.\n");
@@ -966,6 +1000,9 @@ static void print_usage(const char *argv0)
     printf("                     or -1 for any. Enforced inside the LUT. Default:\n");
     printf("                     --pin 0 0 0 --pin 1 7 0 --pin 2 0 7 --pin 3 7 7.\n");
     printf("  --no-pin           Clear all offset pins (previous behaviour).\n");
+    printf("  --regions N        Auto-run N deterministic spiral-valid region blocks, each with\n");
+    printf("                     a valid rx/rz matching the required trailing-one patterns.\n");
+    printf("                     Keeps the old corner/pin args only for debug/single-block runs.\n");
     printf("  --test             Measure MITM lookup time versus fortress evaluation time.\n");
     printf("                     Corner (0,0) gives deltas {0,1,16,17}; that corner's\n");
     printf("                     four-way nextInt(3)==0 filter is unsatisfiable, so it\n");
@@ -1005,63 +1042,16 @@ static int parse_int_arg(const char *s, int *out)
     return 1;
 }
 
-int main(int argc, char **argv)
+static void merge_top(SearchResult *dest, int *dest_n, const SearchResult *src, int src_n)
 {
-    int bits = 28;
-    int nthr = 16;
-    int corner_rx = 0;
-    int corner_rz = 1;
+    for (int i = 0; i < src_n; ++i)
+        top_insert(dest, dest_n, &src[i]);
+}
 
-    if (argc == 3 && argv[1][0] != '-') {
-        if (!parse_int_arg(argv[1], &bits) || !parse_int_arg(argv[2], &nthr)) {
-            print_usage(argv[0]);
-            return 1;
-        }
-    } else {
-        for (int i = 1; i < argc; ++i) {
-            if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-                print_usage(argv[0]);
-                return 0;
-            } else if (!strcmp(argv[i], "-b") || !strcmp(argv[i], "--lut-bits")) {
-                if (++i >= argc || !parse_int_arg(argv[i], &bits))
-                    die("invalid --lut-bits value");
-            } else if (!strcmp(argv[i], "-t") || !strcmp(argv[i], "--threads")) {
-                if (++i >= argc || !parse_int_arg(argv[i], &nthr))
-                    die("invalid --threads value");
-            } else if (!strcmp(argv[i], "--corner-rx")) {
-                if (++i >= argc || !parse_int_arg(argv[i], &corner_rx))
-                    die("invalid --corner-rx value");
-            } else if (!strcmp(argv[i], "--corner-rz")) {
-                if (++i >= argc || !parse_int_arg(argv[i], &corner_rz))
-                    die("invalid --corner-rz value");
-            } else if (!strcmp(argv[i], "--pin")) {
-                int d, px, pz;
-                if (i + 3 >= argc ||
-                    !parse_int_arg(argv[i + 1], &d) ||
-                    !parse_int_arg(argv[i + 2], &px) ||
-                    !parse_int_arg(argv[i + 3], &pz) ||
-                    d < 0 || d >= REGION_COUNT || px < -1 || px > 7 || pz < -1 || pz > 7)
-                    die("--pin needs: D in 0..3, X in -1..7, Z in -1..7");
-                g_pin_x[d] = px;
-                g_pin_z[d] = pz;
-                i += 3;
-            } else if (!strcmp(argv[i], "--no-pin")) {
-                for (int d = 0; d < REGION_COUNT; ++d)
-                    g_pin_x[d] = g_pin_z[d] = -1;
-            } else if (!strcmp(argv[i], "--test")) {
-                g_test_mode = 1;
-            } else {
-                fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-                print_usage(argv[0]);
-                return 1;
-            }
-        }
-    }
-
-    if (bits < 20 || bits > 32)
-        die("--lut-bits must be in [20,32]");
-    if (nthr < 1) nthr = 1;
-    if (nthr > 256) nthr = 256;
+static int run_single_corner(int bits, int nthr, int corner_rx, int corner_rz, SearchResult *top_out, int *top_n_out)
+{
+    int my_top_n = 0;
+    SearchResult my_top[TOP_N];
 
     if (signal(SIGINT, handle_sigint) == SIG_ERR)
         die("failed to bind SIGINT handler");
@@ -1095,18 +1085,7 @@ int main(int argc, char **argv)
     printf("LUT is built fully in RAM, then sorted in RAM; no on-disk table is used.\n");
     fflush(stdout);
 
-    atomic_init(&g_phase, 0);
-    atomic_init(&g_p1_next, 0);
-    atomic_init(&g_p2_next, 0);
-    atomic_init(&g_p1_done, 0);
-    atomic_init(&g_p2_done, 0);
-    atomic_init(&g_mitm_seeds, 0);
-    atomic_init(&g_total_evals, 0);
-    atomic_init(&g_selfcheck_fail, 0);
-    atomic_init(&g_test_queries, 0);
-    atomic_init(&g_test_matches, 0);
-    atomic_init(&g_test_lookup_ns, 0);
-    atomic_init(&g_test_fortress_ns, 0);
+    reset_global_flags();
 
     WorkerCtx *ctxs = (WorkerCtx *)xcalloc((size_t)nthr, sizeof(WorkerCtx));
     for (int i = 0; i < nthr; ++i)
@@ -1158,6 +1137,7 @@ int main(int argc, char **argv)
         }
         free(threads);
         free(ctxs);
+        *top_n_out = 0;
         return 0;
     }
 
@@ -1227,22 +1207,23 @@ output_results:
     printf("LUT self-check failures (should be 0): %" PRIu64 "\n",
            atomic_load_u64(&g_selfcheck_fail));
 
-    // Merge thread-local top 10 lists into one global top 10.
-    SearchResult global_top[TOP_N];
-    int global_top_n = 0;
     for (int i = 0; i < nthr; ++i) {
         for (int j = 0; j < ctxs[i].top_n; ++j)
-            top_insert(global_top, &global_top_n, &ctxs[i].top[j]);
+            top_insert(my_top, &my_top_n, &ctxs[i].top[j]);
     }
 
-    printf("\nTop %d results:\n", global_top_n);
+    printf("\nTop %d results:\n", my_top_n);
 
-    if (global_top_n == 0) {
+    if (my_top_n == 0) {
         printf("No candidates survived the MITM + placement/quadrant filter.\n");
     } else {
-        for (int i = 0; i < global_top_n; ++i)
-            print_result(&global_top[i], i + 1);
+        for (int i = 0; i < my_top_n; ++i)
+            print_result(&my_top[i], i + 1);
     }
+
+    *top_n_out = my_top_n;
+    for (int i = 0; i < my_top_n; ++i)
+        top_out[i] = my_top[i];
 
     if (g_lut) {
         for (size_t r = 0; r < g_nb; ++r) {
@@ -1258,5 +1239,169 @@ output_results:
     }
     free(threads);
     free(ctxs);
+
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    int bits = 28;
+    int nthr = 16;
+    int corner_rx = 0;
+    int corner_rz = 1;
+    int regions = 0;
+
+    if (argc == 3 && argv[1][0] != '-') {
+        if (!parse_int_arg(argv[1], &bits) || !parse_int_arg(argv[2], &nthr)) {
+            print_usage(argv[0]);
+            return 1;
+        }
+    } else {
+        for (int i = 1; i < argc; ++i) {
+            if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+                print_usage(argv[0]);
+                return 0;
+            } else if (!strcmp(argv[i], "-b") || !strcmp(argv[i], "--lut-bits")) {
+                if (++i >= argc || !parse_int_arg(argv[i], &bits))
+                    die("invalid --lut-bits value");
+            } else if (!strcmp(argv[i], "-t") || !strcmp(argv[i], "--threads")) {
+                if (++i >= argc || !parse_int_arg(argv[i], &nthr))
+                    die("invalid --threads value");
+            } else if (!strcmp(argv[i], "--corner-rx")) {
+                if (++i >= argc || !parse_int_arg(argv[i], &corner_rx))
+                    die("invalid --corner-rx value");
+            } else if (!strcmp(argv[i], "--corner-rz")) {
+                if (++i >= argc || !parse_int_arg(argv[i], &corner_rz))
+                    die("invalid --corner-rz value");
+            } else if (!strcmp(argv[i], "--pin")) {
+                int d, px, pz;
+                if (i + 3 >= argc ||
+                    !parse_int_arg(argv[i + 1], &d) ||
+                    !parse_int_arg(argv[i + 2], &px) ||
+                    !parse_int_arg(argv[i + 3], &pz) ||
+                    d < 0 || d >= REGION_COUNT || px < -1 || px > 7 || pz < -1 || pz > 7)
+                    die("--pin needs: D in 0..3, X in -1..7, Z in -1..7");
+                g_pin_x[d] = px;
+                g_pin_z[d] = pz;
+                i += 3;
+            } else if (!strcmp(argv[i], "--no-pin")) {
+                for (int d = 0; d < REGION_COUNT; ++d)
+                    g_pin_x[d] = g_pin_z[d] = -1;
+            } else if (!strcmp(argv[i], "--regions")) {
+                if (++i >= argc || !parse_int_arg(argv[i], &regions) || regions < 1)
+                    die("invalid --regions value");
+                g_regions_mode = 1;
+                g_regions_total = regions;
+            } else if (!strcmp(argv[i], "--test")) {
+                g_test_mode = 1;
+            } else {
+                fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+    }
+
+    if (bits < 20 || bits > 32)
+        die("--lut-bits must be in [20,32]");
+    if (nthr < 1) nthr = 1;
+    if (nthr > 256) nthr = 256;
+
+    if (g_regions_mode) {
+        SearchResult merged_top[TOP_N];
+        int merged_top_n = 0;
+        int found = 0;
+
+        printf("Region sweep mode: scanning %d valid spiral region blocks.\n", g_regions_total);
+        fflush(stdout);
+
+        for (int shell = 0; found < g_regions_total; ++shell) {
+            int x_list[128];
+            int z_list[128];
+            int cnt = 0;
+
+            for (int x = -shell; x <= shell; ++x) {
+                int z = -shell;
+                if (valid_corner(x, z)) {
+                    x_list[cnt] = x;
+                    z_list[cnt] = z;
+                    ++cnt;
+                }
+            }
+            for (int z = -shell + 1; z <= shell; ++z) {
+                int x = shell;
+                if (valid_corner(x, z)) {
+                    x_list[cnt] = x;
+                    z_list[cnt] = z;
+                    ++cnt;
+                }
+            }
+            if (shell > 0) {
+                for (int x = shell - 1; x >= -shell; --x) {
+                    int z = shell;
+                    if (valid_corner(x, z)) {
+                        x_list[cnt] = x;
+                        z_list[cnt] = z;
+                        ++cnt;
+                    }
+                }
+            }
+            if (shell > 0) {
+                for (int z = shell - 1; z >= -shell + 1; --z) {
+                    int x = -shell;
+                    if (valid_corner(x, z)) {
+                        x_list[cnt] = x;
+                        z_list[cnt] = z;
+                        ++cnt;
+                    }
+                }
+            }
+
+            for (int i = 0; i < cnt && found < g_regions_total; ++i) {
+                int rx = x_list[i];
+                int rz = z_list[i];
+                SearchResult local_top[TOP_N];
+                int local_top_n = 0;
+
+                if (signal(SIGINT, handle_sigint) == SIG_ERR)
+                    die("failed to bind SIGINT handler");
+
+                printf("[region %d/%d] testing corner (%d,%d)\n", found + 1, g_regions_total, rx, rz);
+                fflush(stdout);
+                run_single_corner(bits, nthr, rx, rz, local_top, &local_top_n);
+                if (g_stop_requested) {
+                    printf("\nSIGINT received while sweeping valid region blocks.\n");
+                    break;
+                }
+                merge_top(merged_top, &merged_top_n, local_top, local_top_n);
+                ++found;
+            }
+
+            if (g_stop_requested)
+                break;
+        }
+
+        printf("\nMerged top %d results across %d valid region blocks:\n", merged_top_n, found);
+        for (int i = 0; i < merged_top_n; ++i)
+            print_result(&merged_top[i], i + 1);
+
+        return 0;
+    }
+
+    if (signal(SIGINT, handle_sigint) == SIG_ERR)
+        die("failed to bind SIGINT handler");
+
+    SearchResult single_top[TOP_N];
+    int single_top_n = 0;
+    run_single_corner(bits, nthr, corner_rx, corner_rz, single_top, &single_top_n);
+    if (single_top_n == 0) {
+        printf("No candidates survived for this corner.\n");
+        return 0;
+    }
+
+    printf("\nTop %d results for the selected debug corner:\n", single_top_n);
+    for (int i = 0; i < single_top_n; ++i)
+        print_result(&single_top[i], i + 1);
+
     return 0;
 }
