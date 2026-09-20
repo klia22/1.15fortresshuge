@@ -33,14 +33,16 @@ Preset rx and rz do not meet these.
 #define MIN_FORTRESS_PIECES 160
 #define CHUNK_BATCH 4096ULL
 #define H_BATCH 512ULL
+#define AUTO_RX_OPTIONS 2
+#define AUTO_RX_2TRAIL  3   // rx = 3 (mod 8): rx ^ (rx+1) == 0x07
+#define AUTO_RX_3TRAIL  7   // rx = 7 (mod 16): rx ^ (rx+1) == 0x0f
+#define AUTO_RZ_MIN_TRAIL 5 // rz may have any number of trailing ones >= 5
 
 static uint64_t g_feed_deltas[REGION_COUNT] = {0, 1, 48, 49};
 static int g_corner_rx = 0;
 static int g_corner_rz = 1;
 static uint64_t g_base_feed_delta = 16;
 static int g_test_mode;
-static int g_regions_mode;
-static int g_regions_total;
 
 // ----- Required fortress start offsets (the nextInt(8) x/z draws) -----
 // g_pin_x[d] / g_pin_z[d] in 0..7 pins that region's offset to exactly that value
@@ -110,6 +112,164 @@ static atomic_uint_fast64_t g_test_lookup_ns;
 static atomic_uint_fast64_t g_test_fortress_ns;
 static volatile sig_atomic_t g_stop_requested;
 
+static void free_lut(void)
+{
+    if (!g_lut)
+        return;
+    for (size_t r = 0; r < g_nb; ++r) {
+        free(g_lut[r].data);
+        free(g_lut[r].prefix_max_rhi);
+    }
+    free(g_lut);
+    g_lut = NULL;
+    g_lut_entries = 0;
+    g_lut_bytes = 0;
+}
+
+// ----- Automatic corner enumeration -----
+//
+// With the default four pins, valid corners have either
+//   rx = 3 (mod 8)   -> rx ^ (rx+1) = 0x07
+//   rx = 7 (mod 16)  -> rx ^ (rx+1) = 0x0f
+// and rz with at least five trailing one bits.  For a fixed trailing-one
+// count t, every rz = (2^t - 1) + k*2^(t+1) preserves the same z delta.
+// Likewise, stepping rx by 8 or 16 preserves its x delta class.
+//
+// There are only a limited number of distinct RNG-delta signatures, but there
+// are vastly more distinct absolute corners.  Automatic mode therefore uses a
+// round-robin enumeration: the first round contains one corner for every
+// distinct signature, and later rounds continue with fresh absolute corners.
+// This makes --regions 100, 1000, etc. useful instead of imposing an arbitrary
+// 44-iteration ceiling.
+static uint64_t automatic_max_trailing(void)
+{
+    const uint64_t max_region = (uint64_t)(INT_MAX / 32);
+    uint64_t coord_max = 0;
+    while (coord_max < 62 &&
+           ((UINT64_C(1) << (coord_max + 1)) - 1) <= max_region)
+        ++coord_max;
+
+    uint64_t lut_max = (uint64_t)g_b - 5;
+    return lut_max < coord_max ? lut_max : coord_max;
+}
+
+static uint64_t automatic_signature_count(void)
+{
+    const uint64_t max_trailing = automatic_max_trailing();
+    if (max_trailing < AUTO_RZ_MIN_TRAIL)
+        return 0;
+    return 2 * (max_trailing - AUTO_RZ_MIN_TRAIL + 1);
+}
+
+static uint64_t automatic_signature_capacity(uint64_t sig)
+{
+    const uint64_t max_region = (uint64_t)(INT_MAX / 32);
+    const uint64_t trail = AUTO_RZ_MIN_TRAIL + sig / 2;
+    const uint64_t rx_base = (sig & 1) ? AUTO_RX_3TRAIL : AUTO_RX_2TRAIL;
+    const uint64_t rx_step = (rx_base == AUTO_RX_2TRAIL) ? 8 : 16;
+    const uint64_t rz_base = (UINT64_C(1) << trail) - 1;
+    const uint64_t rz_step = UINT64_C(1) << (trail + 1);
+
+    if (rx_base > max_region || rz_base > max_region)
+        return 0;
+
+    const uint64_t rx_count = (max_region - rx_base) / rx_step + 1;
+    const uint64_t rz_count = (max_region - rz_base) / rz_step + 1;
+    if (rx_count != 0 && rz_count > UINT64_MAX / rx_count)
+        return UINT64_MAX;
+    return rx_count * rz_count;
+}
+
+static uint64_t automatic_corner_capacity(void)
+{
+    const uint64_t sig_count = automatic_signature_count();
+    uint64_t total = 0;
+    for (uint64_t sig = 0; sig < sig_count; ++sig) {
+        const uint64_t n = automatic_signature_capacity(sig);
+        if (UINT64_MAX - total < n)
+            return UINT64_MAX;
+        total += n;
+    }
+    return total;
+}
+
+// Number of corners contributed by all signatures in rounds [0, round).
+static uint64_t automatic_count_before_round(uint64_t round, uint64_t sig_count)
+{
+    uint64_t total = 0;
+    for (uint64_t sig = 0; sig < sig_count; ++sig) {
+        const uint64_t cap = automatic_signature_capacity(sig);
+        const uint64_t add = round < cap ? round : cap;
+        if (UINT64_MAX - total < add)
+            return UINT64_MAX;
+        total += add;
+    }
+    return total;
+}
+
+static int automatic_corner(uint64_t iteration, int *rx_out, int *rz_out)
+{
+    const uint64_t max_region = (uint64_t)(INT_MAX / 32);
+    const uint64_t sig_count = automatic_signature_count();
+    const uint64_t capacity = automatic_corner_capacity();
+    if (sig_count == 0 || iteration >= capacity)
+        return 0;
+
+    // Find the round containing this iteration.  At round r, every signature
+    // with capacity > r contributes exactly one corner.
+    uint64_t lo = 0;
+    uint64_t hi = 1;
+    while (hi < capacity && automatic_count_before_round(hi, sig_count) <= iteration) {
+        if (hi > UINT64_MAX / 2)
+            break;
+        hi *= 2;
+    }
+    if (hi > capacity)
+        hi = capacity;
+
+    while (lo < hi) {
+        const uint64_t mid = lo + (hi - lo) / 2;
+        if (automatic_count_before_round(mid, sig_count) <= iteration)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+
+    const uint64_t round = lo == 0 ? 0 : lo - 1;
+    const uint64_t before = automatic_count_before_round(round, sig_count);
+    uint64_t pos = iteration - before;
+
+    uint64_t sig = 0;
+    for (; sig < sig_count; ++sig) {
+        if (automatic_signature_capacity(sig) > round) {
+            if (pos == 0)
+                break;
+            --pos;
+        }
+    }
+    if (sig >= sig_count)
+        return 0;
+
+    const uint64_t trail = AUTO_RZ_MIN_TRAIL + sig / 2;
+    const uint64_t rx_base = (sig & 1) ? AUTO_RX_3TRAIL : AUTO_RX_2TRAIL;
+    const uint64_t rx_step = (rx_base == AUTO_RX_2TRAIL) ? 8 : 16;
+    const uint64_t rz_base = (UINT64_C(1) << trail) - 1;
+    const uint64_t rz_step = UINT64_C(1) << (trail + 1);
+    const uint64_t rx_count = (max_region - rx_base) / rx_step + 1;
+
+    const uint64_t rx_index = round % rx_count;
+    const uint64_t rz_index = round / rx_count;
+    const uint64_t rx = rx_base + rx_index * rx_step;
+    const uint64_t rz = rz_base + rz_index * rz_step;
+
+    if (rx > max_region || rz > max_region)
+        return 0;
+
+    *rx_out = (int)rx;
+    *rz_out = (int)rz;
+    return 1;
+}
+
 static void handle_sigint(int signal_number)
 {
     (void)signal_number;
@@ -145,6 +305,8 @@ typedef struct {
 
 typedef struct {
     uint64_t world_seed;
+    int corner_rx;
+    int corner_rz;
     int four_piece_count;
     int total_pieces;
     RegionDetail region[REGION_COUNT];
@@ -233,38 +395,6 @@ static void vec_push(EntryVec *v, LEntry e)
         v->cap = nc;
     }
     v->data[v->count++] = e;
-}
-
-static int valid_rx(int rx)
-{
-    return ((rx & 7) == 3) || ((rx & 15) == 7);
-}
-
-static int valid_rz(int rz)
-{
-    return (rz & 31) == 31;
-}
-
-static int valid_corner(int rx, int rz)
-{
-    return valid_rx(rx) && valid_rz(rz);
-}
-
-static void reset_global_flags(void)
-{
-    g_stop_requested = 0;
-    atomic_store_explicit(&g_phase, 0, memory_order_relaxed);
-    atomic_store_explicit(&g_p1_next, 0, memory_order_relaxed);
-    atomic_store_explicit(&g_p2_next, 0, memory_order_relaxed);
-    atomic_store_explicit(&g_p1_done, 0, memory_order_relaxed);
-    atomic_store_explicit(&g_p2_done, 0, memory_order_relaxed);
-    atomic_store_explicit(&g_mitm_seeds, 0, memory_order_relaxed);
-    atomic_store_explicit(&g_total_evals, 0, memory_order_relaxed);
-    atomic_store_explicit(&g_selfcheck_fail, 0, memory_order_relaxed);
-    atomic_store_explicit(&g_test_queries, 0, memory_order_relaxed);
-    atomic_store_explicit(&g_test_matches, 0, memory_order_relaxed);
-    atomic_store_explicit(&g_test_lookup_ns, 0, memory_order_relaxed);
-    atomic_store_explicit(&g_test_fortress_ns, 0, memory_order_relaxed);
 }
 
 // ----- Setup and exact L-side math -----
@@ -758,6 +888,8 @@ static void make_detailed_result(const CandidateSummary *sum, SearchResult *out)
 {
     memset(out, 0, sizeof(*out));
     out->world_seed = sum->world_seed;
+    out->corner_rx = g_corner_rx;
+    out->corner_rz = g_corner_rz;
     out->four_piece_count = sum->four_piece_count;
     out->total_pieces = sum->total_pieces;
 
@@ -821,6 +953,44 @@ typedef struct {
     uint64_t Q3;
     uint64_t Q4;
 } CandidateCallbackCtx;
+
+static void free_worker_vectors(WorkerCtx *ctxs, int nthr)
+{
+    for (int i = 0; i < nthr; ++i) {
+        if (!ctxs[i].v)
+            continue;
+        for (size_t r = 0; r < g_nb; ++r) {
+            free(ctxs[i].v[r].data);
+            ctxs[i].v[r].data = NULL;
+            ctxs[i].v[r].count = 0;
+            ctxs[i].v[r].cap = 0;
+        }
+    }
+}
+
+static void reset_iteration_state(WorkerCtx *ctxs, int nthr)
+{
+    free_lut();
+    free_worker_vectors(ctxs, nthr);
+
+    atomic_store_explicit(&g_phase, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_p1_next, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_p2_next, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_p1_done, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_p2_done, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_mitm_seeds, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_total_evals, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_selfcheck_fail, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_test_queries, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_test_matches, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_test_lookup_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_test_fortress_ns, 0, memory_order_relaxed);
+
+    for (int i = 0; i < nthr; ++i) {
+        ctxs[i].top_n = 0;
+        ctxs[i].local_evals = 0;
+    }
+}
 
 static void evaluate_one_L(const LEntry *e, void *opaque)
 {
@@ -907,6 +1077,11 @@ static void *monitor_thread(void *arg)
     uint64_t last_work = 0;
     double last_t = 0.0;
     int last_phase = -1;
+    uint64_t last_evals = 0;
+    double last_eval_t = 0.0;
+    uint64_t last_mitm_seeds = 0;
+    double last_mitm_t = 0.0;
+
     for (;;) {
         sleep(1);
 
@@ -952,18 +1127,16 @@ static void *monitor_thread(void *arg)
             last_t = now;
         }
 
-        static uint64_t last_evals = 0;
-        static double last_eval_t = 0.0;
-        static uint64_t last_mitm_seeds = 0;
-        static double last_mitm_t = 0.0;
         double eval_dt = now - last_eval_t;
         uint64_t eval_rate_count = evals - last_evals;
-        double eval_rate = eval_dt > 0.0 ? (double)eval_rate_count / eval_dt : 0.0;
+        double eval_rate = last_eval_t > 0.0 && eval_dt > 0.0
+            ? (double)eval_rate_count / eval_dt : 0.0;
         last_evals = evals;
         last_eval_t = now;
         double mitm_dt = now - last_mitm_t;
         uint64_t mitm_rate_count = mitm_seeds - last_mitm_seeds;
-        double mitm_rate = mitm_dt > 0.0 ? (double)mitm_rate_count / mitm_dt : 0.0;
+        double mitm_rate = last_mitm_t > 0.0 && mitm_dt > 0.0
+            ? (double)mitm_rate_count / mitm_dt : 0.0;
         last_mitm_seeds = mitm_seeds;
         last_mitm_t = now;
 
@@ -983,26 +1156,30 @@ static void *monitor_thread(void *arg)
 // ----- Printing -----
 static void print_usage(const char *argv0)
 {
-    printf("Usage: %s [--lut-bits N] [--threads N] [--corner-rx N] [--corner-rz N]\n", argv0);
-    printf("          [--pin D X Z]... [--no-pin] [--regions N] [--test]\n");
+    printf("Usage: %s --regions N [--lut-bits N] [--threads N] [--test]\n", argv0);
+    printf("       %s [--lut-bits N] [--threads N] [--corner-rx N] [--corner-rz N]\n", argv0);
+    printf("          [--pin D X Z]... [--no-pin] [--test]\n");
     printf("       %s N THREADS        (legacy positional form)\n\n", argv0);
+    printf("  --regions N         Run N automatic 2x2 region searches.  Corners are\n");
+    printf("                     unique; the first round covers every distinct RNG/feed-delta\n");
+    printf("                     signature, then later rounds continue with fresh coordinates.\n");
+    printf("                     There is no small fixed iteration limit; only the safe int\n");
+    printf("                     region-coordinate range limits the total number of corners.\n");
+    printf("                     After all N searches, report the global top 10.\n");
     printf("  --lut-bits, -b N   Number of LOW bits placed in the MITM LUT [20..32].\n");
     printf("                     Larger N = larger RAM LUT, smaller H scan.\n");
     printf("  --threads, -t N    Worker thread count [1..256].\n");
-    printf("  --corner-rx N      Base region X (chunk>>4) for the 2x2 block. Default 0.\n");
-    printf("  --corner-rz N      Base region Z (chunk>>4) for the 2x2 block. Default 1.\n");
+    printf("  --corner-rx N      DEBUG: base region X (chunk>>4) for one legacy search.\n");
+    printf("  --corner-rz N      DEBUG: base region Z (chunk>>4) for one legacy search.\n");
     printf("                     Only the number of trailing 1-bits of rx / rz matters for\n");
     printf("                     satisfiability. With the default 4 pins it needs rx = 3 mod 8\n");
     printf("                     or 7 mod 16, and rz = 31 mod 32 (negative values are allowed;\n");
     printf("                     rx/rz = -1 is not supported).\n");
-    printf("  --pin D X Z        Require region D (0=(rx,rz) lo, 1=(rx+1,rz), 2=(rx,rz+1),\n");
+    printf("  --pin D X Z        DEBUG: require region D (0=(rx,rz) lo, 1=(rx+1,rz), 2=(rx,rz+1),\n");
     printf("                     3=(rx+1,rz+1) hi) to have fortress offset (X,Z), each 0..7\n");
     printf("                     or -1 for any. Enforced inside the LUT. Default:\n");
     printf("                     --pin 0 0 0 --pin 1 7 0 --pin 2 0 7 --pin 3 7 7.\n");
-    printf("  --no-pin           Clear all offset pins (previous behaviour).\n");
-    printf("  --regions N        Auto-run N deterministic spiral-valid region blocks, each with\n");
-    printf("                     a valid rx/rz matching the required trailing-one patterns.\n");
-    printf("                     Keeps the old corner/pin args only for debug/single-block runs.\n");
+    printf("  --no-pin           DEBUG: clear all offset pins (legacy behaviour).\n");
     printf("  --test             Measure MITM lookup time versus fortress evaluation time.\n");
     printf("                     Corner (0,0) gives deltas {0,1,16,17}; that corner's\n");
     printf("                     four-way nextInt(3)==0 filter is unsatisfiable, so it\n");
@@ -1017,13 +1194,15 @@ static void print_hex_seed(uint64_t x)
 
 static void print_result(const SearchResult *r, int rank)
 {
-    printf("#%d rngSeeds=%012" PRIx64 ",%012" PRIx64 ",%012" PRIx64 ",%012" PRIx64
-        " pieces=%d,%d,%d,%d total=%d\n",
+    printf("#%d rngSeeds=0x%012" PRIx64 ",0x%012" PRIx64 ",0x%012" PRIx64 ",0x%012" PRIx64
+        " rx=%d rz=%d pieces=%d,%d,%d,%d total=%d\n",
         rank,
         r->region[0].rng_s0,
         r->region[1].rng_s0,
         r->region[2].rng_s0,
         r->region[3].rng_s0,
+        r->corner_rx,
+        r->corner_rz,
         r->region[0].piece_count,
         r->region[1].piece_count,
         r->region[2].piece_count,
@@ -1042,206 +1221,17 @@ static int parse_int_arg(const char *s, int *out)
     return 1;
 }
 
-static void merge_top(SearchResult *dest, int *dest_n, const SearchResult *src, int src_n)
+static int parse_u64_arg(const char *s, uint64_t *out)
 {
-    for (int i = 0; i < src_n; ++i)
-        top_insert(dest, dest_n, &src[i]);
-}
-
-static int run_single_corner(int bits, int nthr, int corner_rx, int corner_rz, SearchResult *top_out, int *top_n_out)
-{
-    int my_top_n = 0;
-    SearchResult my_top[TOP_N];
-
-    if (signal(SIGINT, handle_sigint) == SIG_ERR)
-        die("failed to bind SIGINT handler");
-
-    setup_corner(corner_rx, corner_rz);
-    setup(bits);
-
-    printf("Corner region=(%d,%d)  feeds deltas={0,0x%llx,0x%llx,0x%llx}  baseDelta=0x%llx\n",
-           g_corner_rx, g_corner_rz,
-           (unsigned long long)g_feed_deltas[1],
-           (unsigned long long)g_feed_deltas[2],
-           (unsigned long long)g_feed_deltas[3],
-           (unsigned long long)g_base_feed_delta);
-    for (int d = 0; d < REGION_COUNT; ++d) {
-        printf("  region %d pin: x=", d);
-        if (g_pin_x[d] >= 0) printf("%d", g_pin_x[d]); else printf("any");
-        printf(" z=");
-        if (g_pin_z[d] >= 0) printf("%d", g_pin_z[d]); else printf("any");
-        printf("\n");
-    }
-    printf("LUT grid: %d x %d cells x %d residues = %zu buckets\n",
-           g_G3, g_G4, LUT_BUCKETS, g_nb);
-
-    long cpu_count = 16;
-    if (cpu_count > 0 && nthr > cpu_count * 4)
-        fprintf(stderr, "Note: using %d threads on %ld online CPUs.\n", nthr, cpu_count);
-
-    printf("MITM split: b=%d LOW bits in LUT, H=%d HIGH bits scanned\n", bits, 48 - bits);
-    printf("L side: 2^%d = %" PRIu64 " values\n", bits, g_lower_size);
-    printf("H side: 2^%d = %" PRIu64 " values\n", 48 - bits, g_upper_size);
-    printf("LUT is built fully in RAM, then sorted in RAM; no on-disk table is used.\n");
-    fflush(stdout);
-
-    reset_global_flags();
-
-    WorkerCtx *ctxs = (WorkerCtx *)xcalloc((size_t)nthr, sizeof(WorkerCtx));
-    for (int i = 0; i < nthr; ++i)
-        ctxs[i].v = (EntryVec *)xcalloc(g_nb, sizeof(EntryVec));
-    pthread_t *threads = (pthread_t *)xmalloc((size_t)nthr * sizeof(pthread_t));
-
-    pthread_t mon;
-    if (pthread_create(&mon, NULL, monitor_thread, NULL) != 0)
-        die("pthread_create(monitor) failed");
-
-    atomic_store_explicit(&g_phase, 1, memory_order_relaxed);
-    printf("Phase 1: building LUT...\n");
-    fflush(stdout);
-    for (int i = 0; i < nthr; ++i) {
-        if (pthread_create(&threads[i], NULL, phase1_worker, &ctxs[i]) != 0)
-            die("pthread_create(phase1) failed");
-    }
-    for (int i = 0; i < nthr; ++i)
-        pthread_join(threads[i], NULL);
-
-    if (g_stop_requested) {
-        atomic_store_explicit(&g_phase, 4, memory_order_relaxed);
-        pthread_join(mon, NULL);
-        goto output_results;
-    }
-
-    uint64_t raw_counts[LUT_BUCKETS] = {0, 0, 0};
-    for (size_t r = 0; r < g_nb; ++r) {
-        size_t res = r / ((size_t)g_G3 * (size_t)g_G4);
-        for (int i = 0; i < nthr; ++i)
-            raw_counts[res] += (uint64_t)ctxs[i].v[r].count;
-    }
-
-    printf("Phase 1 complete: raw entries req0=%" PRIu64 " req1=%" PRIu64 " req2=%" PRIu64 " total=%" PRIu64 "\n",
-           raw_counts[0], raw_counts[1], raw_counts[2],
-           raw_counts[0] + raw_counts[1] + raw_counts[2]);
-    fflush(stdout);
-
-    g_lut_entries = raw_counts[0] + raw_counts[1] + raw_counts[2];
-    if (g_lut_entries == 0) {
-        printf("LUT is empty: the placement constraints (nextInt(3) + pinned offsets) are unsatisfiable for this corner/pin set.\n");
-        printf("No H seeds will be scanned. Choose another --corner-rx/--corner-rz or different --pin values.\n");
-        atomic_store_explicit(&g_phase, 4, memory_order_relaxed);
-        pthread_join(mon, NULL);
-        for (int i = 0; i < nthr; ++i) {
-            for (size_t r = 0; r < g_nb; ++r)
-                free(ctxs[i].v[r].data);
-            free(ctxs[i].v);
-        }
-        free(threads);
-        free(ctxs);
-        *top_n_out = 0;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (errno || end == s || *end != '\0')
         return 0;
-    }
-
-    build_lut(ctxs, nthr);
-    if (g_stop_requested) {
-        atomic_store_explicit(&g_phase, 4, memory_order_relaxed);
-        pthread_join(mon, NULL);
-        goto output_results;
-    }
-    printf("LUT loaded in RAM: %" PRIu64 " entries (incl. grid replication), %.2f MiB incl. prefix index\n",
-           g_lut_entries, (double)g_lut_bytes / (1024.0 * 1024.0));
-    for (int res = 0; res < LUT_BUCKETS; ++res) {
-        uint64_t n = 0;
-        size_t per = (size_t)g_G3 * (size_t)g_G4;
-        for (size_t k = 0; k < per; ++k)
-            n += g_lut[(size_t)res * per + k].count;
-        printf("  residue %d: %" PRIu64 " entries over %zu cells\n", res, n, per);
-    }
-    fflush(stdout);
-
-    // Sanity check sorting; catches accidental unsorted-table bugs immediately.
-    for (size_t r = 0; r < g_nb; ++r) {
-        for (size_t i = 1; i < g_lut[r].count; ++i) {
-            if (cmp_lut_entry(&g_lut[r].data[i-1], &g_lut[r].data[i]) > 0)
-                die("internal error: LUT bucket is not sorted");
-        }
-    }
-    if (g_stop_requested) {
-        atomic_store_explicit(&g_phase, 4, memory_order_relaxed);
-        pthread_join(mon, NULL);
-        goto output_results;
-    }
-    printf("LUT sort/ordering sanity check: OK\n");
-    fflush(stdout);
-
-    atomic_store_explicit(&g_phase, 3, memory_order_relaxed);
-    printf("Phase 2: scanning H and evaluating candidates...\n");
-    fflush(stdout);
-    for (int i = 0; i < nthr; ++i) {
-        if (pthread_create(&threads[i], NULL, phase2_worker, &ctxs[i]) != 0)
-            die("pthread_create(phase2) failed");
-    }
-    for (int i = 0; i < nthr; ++i)
-        pthread_join(threads[i], NULL);
-
-    atomic_store_explicit(&g_phase, 4, memory_order_relaxed);
-    pthread_join(mon, NULL);
-
-output_results:
-    if (g_stop_requested)
-        printf("\nSIGINT received; stopping search and reporting results found so far.\n");
-
-    if (g_test_mode) {
-        uint64_t queries = atomic_load_u64(&g_test_queries);
-        uint64_t matches = atomic_load_u64(&g_test_matches);
-        uint64_t lookup_ns = atomic_load_u64(&g_test_lookup_ns);
-        uint64_t fortress_ns = atomic_load_u64(&g_test_fortress_ns);
-        uint64_t mitm_ns = lookup_ns > fortress_ns ? lookup_ns - fortress_ns : 0;
-        printf("TEST measurements: queries=%" PRIu64 " matches=%" PRIu64 "\n",
-               queries, matches);
-        printf("  MITM + fortress total: %.3f s\n", (double)lookup_ns / 1e9);
-        printf("  fortress evaluation:   %.3f s\n", (double)fortress_ns / 1e9);
-        printf("  MITM overhead:         %.3f s\n", (double)mitm_ns / 1e9);
-    }
-    printf("MITM matches (all constraints satisfied): %" PRIu64 "   fortress-evaluated: %" PRIu64 "\n",
-           atomic_load_u64(&g_mitm_seeds), atomic_load_u64(&g_total_evals));
-    printf("LUT self-check failures (should be 0): %" PRIu64 "\n",
-           atomic_load_u64(&g_selfcheck_fail));
-
-    for (int i = 0; i < nthr; ++i) {
-        for (int j = 0; j < ctxs[i].top_n; ++j)
-            top_insert(my_top, &my_top_n, &ctxs[i].top[j]);
-    }
-
-    printf("\nTop %d results:\n", my_top_n);
-
-    if (my_top_n == 0) {
-        printf("No candidates survived the MITM + placement/quadrant filter.\n");
-    } else {
-        for (int i = 0; i < my_top_n; ++i)
-            print_result(&my_top[i], i + 1);
-    }
-
-    *top_n_out = my_top_n;
-    for (int i = 0; i < my_top_n; ++i)
-        top_out[i] = my_top[i];
-
-    if (g_lut) {
-        for (size_t r = 0; r < g_nb; ++r) {
-            free(g_lut[r].data);
-            free(g_lut[r].prefix_max_rhi);
-        }
-        free(g_lut);
-    }
-    for (int i = 0; i < nthr; ++i) {
-        for (size_t r = 0; r < g_nb; ++r)
-            free(ctxs[i].v[r].data);
-        free(ctxs[i].v);
-    }
-    free(threads);
-    free(ctxs);
-
-    return 0;
+    *out = (uint64_t)v;
+    return 1;
 }
+
 
 int main(int argc, char **argv)
 {
@@ -1249,7 +1239,9 @@ int main(int argc, char **argv)
     int nthr = 16;
     int corner_rx = 0;
     int corner_rz = 1;
-    int regions = 0;
+    uint64_t regions = 0;
+    int legacy_corner_used = 0;
+    int legacy_pin_used = 0;
 
     if (argc == 3 && argv[1][0] != '-') {
         if (!parse_int_arg(argv[1], &bits) || !parse_int_arg(argv[2], &nthr)) {
@@ -1261,6 +1253,9 @@ int main(int argc, char **argv)
             if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
                 print_usage(argv[0]);
                 return 0;
+            } else if (!strcmp(argv[i], "--regions")) {
+                if (++i >= argc || !parse_u64_arg(argv[i], &regions))
+                    die("invalid --regions value");
             } else if (!strcmp(argv[i], "-b") || !strcmp(argv[i], "--lut-bits")) {
                 if (++i >= argc || !parse_int_arg(argv[i], &bits))
                     die("invalid --lut-bits value");
@@ -1270,9 +1265,11 @@ int main(int argc, char **argv)
             } else if (!strcmp(argv[i], "--corner-rx")) {
                 if (++i >= argc || !parse_int_arg(argv[i], &corner_rx))
                     die("invalid --corner-rx value");
+                legacy_corner_used = 1;
             } else if (!strcmp(argv[i], "--corner-rz")) {
                 if (++i >= argc || !parse_int_arg(argv[i], &corner_rz))
                     die("invalid --corner-rz value");
+                legacy_corner_used = 1;
             } else if (!strcmp(argv[i], "--pin")) {
                 int d, px, pz;
                 if (i + 3 >= argc ||
@@ -1283,15 +1280,12 @@ int main(int argc, char **argv)
                     die("--pin needs: D in 0..3, X in -1..7, Z in -1..7");
                 g_pin_x[d] = px;
                 g_pin_z[d] = pz;
+                legacy_pin_used = 1;
                 i += 3;
             } else if (!strcmp(argv[i], "--no-pin")) {
                 for (int d = 0; d < REGION_COUNT; ++d)
                     g_pin_x[d] = g_pin_z[d] = -1;
-            } else if (!strcmp(argv[i], "--regions")) {
-                if (++i >= argc || !parse_int_arg(argv[i], &regions) || regions < 1)
-                    die("invalid --regions value");
-                g_regions_mode = 1;
-                g_regions_total = regions;
+                legacy_pin_used = 1;
             } else if (!strcmp(argv[i], "--test")) {
                 g_test_mode = 1;
             } else {
@@ -1307,101 +1301,260 @@ int main(int argc, char **argv)
     if (nthr < 1) nthr = 1;
     if (nthr > 256) nthr = 256;
 
-    if (g_regions_mode) {
-        SearchResult merged_top[TOP_N];
-        int merged_top_n = 0;
-        int found = 0;
-
-        printf("Region sweep mode: scanning %d valid spiral region blocks.\n", g_regions_total);
-        fflush(stdout);
-
-        for (int shell = 0; found < g_regions_total; ++shell) {
-            int x_list[128];
-            int z_list[128];
-            int cnt = 0;
-
-            for (int x = -shell; x <= shell; ++x) {
-                int z = -shell;
-                if (valid_corner(x, z)) {
-                    x_list[cnt] = x;
-                    z_list[cnt] = z;
-                    ++cnt;
-                }
-            }
-            for (int z = -shell + 1; z <= shell; ++z) {
-                int x = shell;
-                if (valid_corner(x, z)) {
-                    x_list[cnt] = x;
-                    z_list[cnt] = z;
-                    ++cnt;
-                }
-            }
-            if (shell > 0) {
-                for (int x = shell - 1; x >= -shell; --x) {
-                    int z = shell;
-                    if (valid_corner(x, z)) {
-                        x_list[cnt] = x;
-                        z_list[cnt] = z;
-                        ++cnt;
-                    }
-                }
-            }
-            if (shell > 0) {
-                for (int z = shell - 1; z >= -shell + 1; --z) {
-                    int x = -shell;
-                    if (valid_corner(x, z)) {
-                        x_list[cnt] = x;
-                        z_list[cnt] = z;
-                        ++cnt;
-                    }
-                }
-            }
-
-            for (int i = 0; i < cnt && found < g_regions_total; ++i) {
-                int rx = x_list[i];
-                int rz = z_list[i];
-                SearchResult local_top[TOP_N];
-                int local_top_n = 0;
-
-                if (signal(SIGINT, handle_sigint) == SIG_ERR)
-                    die("failed to bind SIGINT handler");
-
-                printf("[region %d/%d] testing corner (%d,%d)\n", found + 1, g_regions_total, rx, rz);
-                fflush(stdout);
-                run_single_corner(bits, nthr, rx, rz, local_top, &local_top_n);
-                if (g_stop_requested) {
-                    printf("\nSIGINT received while sweeping valid region blocks.\n");
-                    break;
-                }
-                merge_top(merged_top, &merged_top_n, local_top, local_top_n);
-                ++found;
-            }
-
-            if (g_stop_requested)
-                break;
-        }
-
-        printf("\nMerged top %d results across %d valid region blocks:\n", merged_top_n, found);
-        for (int i = 0; i < merged_top_n; ++i)
-            print_result(&merged_top[i], i + 1);
-
-        return 0;
-    }
+    if (regions > 0 && (legacy_corner_used || legacy_pin_used))
+        die("--regions is automatic mode; do not combine it with the legacy corner/pin debug flags");
 
     if (signal(SIGINT, handle_sigint) == SIG_ERR)
         die("failed to bind SIGINT handler");
 
-    SearchResult single_top[TOP_N];
-    int single_top_n = 0;
-    run_single_corner(bits, nthr, corner_rx, corner_rz, single_top, &single_top_n);
-    if (single_top_n == 0) {
-        printf("No candidates survived for this corner.\n");
-        return 0;
+    setup(bits);
+
+    uint64_t max_auto_regions = automatic_corner_capacity();
+    if (regions > 0 && regions > max_auto_regions)
+        die("--regions exceeds the safe automatic corner-coordinate capacity");
+
+    long cpu_count = 16;
+    if (cpu_count <= 0)
+        cpu_count = 16;
+    if (cpu_count > 0 && nthr > cpu_count * 4)
+        fprintf(stderr, "Note: using %d threads on %ld online CPUs.\n", nthr, cpu_count);
+
+    printf("MITM split: b=%d LOW bits in LUT, H=%d HIGH bits scanned\n", bits, 48 - bits);
+    printf("L side: 2^%d = %" PRIu64 " values\n", bits, g_lower_size);
+    printf("H side: 2^%d = %" PRIu64 " values\n", 48 - bits, g_upper_size);
+    printf("LUT is built fully in RAM, then sorted in RAM; no on-disk table is used.\n");
+
+    if (regions > 0) {
+        printf("Automatic region mode: %" PRIu64 " iterations requested.\n", regions);
+        printf("Automatic corners are unique; the first round uses every distinct RNG-delta signature,\n");
+        printf("then later rounds continue with fresh absolute corners while preserving valid trailing-one classes.\n");
+        printf("Distinct RNG-delta signatures available at b=%d: %" PRIu64 "\n",
+               bits, automatic_signature_count());
+        printf("Total safe unique automatic corners available: %" PRIu64 "\n", max_auto_regions);
+    } else {
+        printf("Legacy single-corner mode: use --corner-rx/--corner-rz and pin flags for debugging.\n");
+    }
+    fflush(stdout);
+
+    atomic_init(&g_phase, 0);
+    atomic_init(&g_p1_next, 0);
+    atomic_init(&g_p2_next, 0);
+    atomic_init(&g_p1_done, 0);
+    atomic_init(&g_p2_done, 0);
+    atomic_init(&g_mitm_seeds, 0);
+    atomic_init(&g_total_evals, 0);
+    atomic_init(&g_selfcheck_fail, 0);
+    atomic_init(&g_test_queries, 0);
+    atomic_init(&g_test_matches, 0);
+    atomic_init(&g_test_lookup_ns, 0);
+    atomic_init(&g_test_fortress_ns, 0);
+
+    WorkerCtx *ctxs = (WorkerCtx *)xcalloc((size_t)nthr, sizeof(WorkerCtx));
+    for (int i = 0; i < nthr; ++i)
+        ctxs[i].v = (EntryVec *)xcalloc(g_nb, sizeof(EntryVec));
+    pthread_t *threads = (pthread_t *)xmalloc((size_t)nthr * sizeof(pthread_t));
+
+    SearchResult global_top[TOP_N];
+    int global_top_n = 0;
+    uint64_t aggregate_mitm = 0;
+    uint64_t aggregate_evals = 0;
+    uint64_t aggregate_selfcheck = 0;
+    uint64_t start_all = monotonic_ns();
+    uint64_t completed_iterations = 0;
+
+    uint64_t iterations = regions > 0 ? regions : 1;
+    for (uint64_t iter = 0; iter < iterations && !g_stop_requested; ++iter) {
+        if (regions > 0) {
+            if (!automatic_corner((uint64_t)iter, &corner_rx, &corner_rz))
+                die("failed to generate automatic corner");
+        }
+
+        setup_corner(corner_rx, corner_rz);
+        reset_iteration_state(ctxs, nthr);
+
+        if (regions > 0) {
+            printf("\n=== Iteration %" PRIu64 "/%" PRIu64 ": corner region=(%d,%d) ===\n",
+                   iter + 1, regions, corner_rx, corner_rz);
+        } else {
+            printf("\n=== Single legacy search: corner region=(%d,%d) ===\n",
+                   corner_rx, corner_rz);
+        }
+        printf("Corner feeds: deltas={0,0x%llx,0x%llx,0x%llx} baseDelta=0x%llx\n",
+               (unsigned long long)g_feed_deltas[1],
+               (unsigned long long)g_feed_deltas[2],
+               (unsigned long long)g_feed_deltas[3],
+               (unsigned long long)g_base_feed_delta);
+        for (int d = 0; d < REGION_COUNT; ++d) {
+            printf("  region %d pin: x=", d);
+            if (g_pin_x[d] >= 0) printf("%d", g_pin_x[d]); else printf("any");
+            printf(" z=");
+            if (g_pin_z[d] >= 0) printf("%d", g_pin_z[d]); else printf("any");
+            printf("\n");
+        }
+        printf("LUT grid: %d x %d cells x %d residues = %zu buckets\n",
+               g_G3, g_G4, LUT_BUCKETS, g_nb);
+        fflush(stdout);
+
+        atomic_store_explicit(&g_phase, 1, memory_order_relaxed);
+        pthread_t mon;
+        if (pthread_create(&mon, NULL, monitor_thread, NULL) != 0)
+            die("pthread_create(monitor) failed");
+
+        printf("Phase 1: building LUT...\n");
+        fflush(stdout);
+        for (int i = 0; i < nthr; ++i) {
+            if (pthread_create(&threads[i], NULL, phase1_worker, &ctxs[i]) != 0)
+                die("pthread_create(phase1) failed");
+        }
+        for (int i = 0; i < nthr; ++i)
+            pthread_join(threads[i], NULL);
+
+        int iteration_has_lut = 1;
+        uint64_t raw_counts[LUT_BUCKETS] = {0, 0, 0};
+        for (size_t r = 0; r < g_nb; ++r) {
+            size_t res = r / ((size_t)g_G3 * (size_t)g_G4);
+            for (int i = 0; i < nthr; ++i)
+                raw_counts[res] += (uint64_t)ctxs[i].v[r].count;
+        }
+
+        uint64_t raw_total = raw_counts[0] + raw_counts[1] + raw_counts[2];
+        printf("Phase 1 complete: raw entries req0=%" PRIu64 " req1=%" PRIu64 " req2=%" PRIu64 " total=%" PRIu64 "\n",
+               raw_counts[0], raw_counts[1], raw_counts[2], raw_total);
+        fflush(stdout);
+
+        g_lut_entries = raw_total;
+        if (g_lut_entries == 0) {
+            iteration_has_lut = 0;
+            printf("ERROR: automatic corner produced an empty LUT; this indicates the default pin assumptions changed.\n");
+        }
+
+        SearchResult iteration_top[TOP_N];
+        int iteration_top_n = 0;
+
+        if (iteration_has_lut && !g_stop_requested) {
+            build_lut(ctxs, nthr);
+            if (!g_stop_requested) {
+                printf("LUT loaded in RAM: %" PRIu64 " entries (incl. grid replication), %.2f MiB incl. prefix index\n",
+                       g_lut_entries, (double)g_lut_bytes / (1024.0 * 1024.0));
+                for (int res = 0; res < LUT_BUCKETS; ++res) {
+                    uint64_t n = 0;
+                    size_t per = (size_t)g_G3 * (size_t)g_G4;
+                    for (size_t k = 0; k < per; ++k)
+                        n += g_lut[(size_t)res * per + k].count;
+                    printf("  residue %d: %" PRIu64 " entries over %zu cells\n", res, n, per);
+                }
+                fflush(stdout);
+
+                for (size_t r = 0; r < g_nb; ++r) {
+                    for (size_t i = 1; i < g_lut[r].count; ++i) {
+                        if (cmp_lut_entry(&g_lut[r].data[i-1], &g_lut[r].data[i]) > 0)
+                            die("internal error: LUT bucket is not sorted");
+                    }
+                }
+
+                printf("LUT sort/ordering sanity check: OK\n");
+                fflush(stdout);
+
+                atomic_store_explicit(&g_phase, 3, memory_order_relaxed);
+                printf("Phase 2: scanning H and evaluating candidates...\n");
+                fflush(stdout);
+                for (int i = 0; i < nthr; ++i) {
+                    if (pthread_create(&threads[i], NULL, phase2_worker, &ctxs[i]) != 0)
+                        die("pthread_create(phase2) failed");
+                }
+                for (int i = 0; i < nthr; ++i)
+                    pthread_join(threads[i], NULL);
+                atomic_store_explicit(&g_phase, 4, memory_order_relaxed);
+
+                for (int i = 0; i < nthr; ++i) {
+                    for (int j = 0; j < ctxs[i].top_n; ++j)
+                        top_insert(iteration_top, &iteration_top_n, &ctxs[i].top[j]);
+                }
+            }
+        }
+
+        atomic_store_explicit(&g_phase, 4, memory_order_relaxed);
+        pthread_join(mon, NULL);
+
+        uint64_t iter_mitm = atomic_load_u64(&g_mitm_seeds);
+        uint64_t iter_evals = atomic_load_u64(&g_total_evals);
+        uint64_t iter_selfcheck = atomic_load_u64(&g_selfcheck_fail);
+        aggregate_mitm += iter_mitm;
+        aggregate_evals += iter_evals;
+        aggregate_selfcheck += iter_selfcheck;
+
+        if (iteration_top_n > 0) {
+            printf("\nTop %d results for iteration %" PRIu64 " (corner rx=%d rz=%d):\n",
+                   iteration_top_n, iter + 1, corner_rx, corner_rz);
+            for (int i = 0; i < iteration_top_n; ++i) {
+                print_result(&iteration_top[i], i + 1);
+                top_insert(global_top, &global_top_n, &iteration_top[i]);
+            }
+
+        } else {
+            printf("Iteration %" PRIu64 ": no valid fortress candidates.\n", iter + 1);
+        }
+
+        if (g_test_mode) {
+            uint64_t queries = atomic_load_u64(&g_test_queries);
+            uint64_t matches = atomic_load_u64(&g_test_matches);
+            uint64_t lookup_ns = atomic_load_u64(&g_test_lookup_ns);
+            uint64_t fortress_ns = atomic_load_u64(&g_test_fortress_ns);
+            uint64_t mitm_ns = lookup_ns > fortress_ns ? lookup_ns - fortress_ns : 0;
+            printf("TEST measurements: queries=%" PRIu64 " matches=%" PRIu64 "\n",
+                   queries, matches);
+            printf("  MITM + fortress total: %.3f s\n", (double)lookup_ns / 1e9);
+            printf("  fortress evaluation:   %.3f s\n", (double)fortress_ns / 1e9);
+            printf("  MITM overhead:         %.3f s\n", (double)mitm_ns / 1e9);
+        }
+
+        printf("Iteration %" PRIu64 ": MITM matches=%" PRIu64 " fortress-evaluated=%" PRIu64
+               " selfcheck-failures=%" PRIu64 "\n",
+               iter + 1, iter_mitm, iter_evals, iter_selfcheck);
+
+        free_lut();
+        free_worker_vectors(ctxs, nthr);
+        ++completed_iterations;
     }
 
-    printf("\nTop %d results for the selected debug corner:\n", single_top_n);
-    for (int i = 0; i < single_top_n; ++i)
-        print_result(&single_top[i], i + 1);
+    if (g_stop_requested)
+        printf("\nSIGINT received; stopping search and reporting results found so far.\n");
 
+    double total_sec = (double)(monotonic_ns() - start_all) / 1e9;
+    if (regions > 0) {
+        printf("\nAutomatic region search complete: %" PRIu64 "/%" PRIu64 " iterations finished in %.3f s.\n",
+               completed_iterations, regions, total_sec);
+        printf("Aggregate MITM matches=%" PRIu64 " fortress-evaluated=%" PRIu64
+               " selfcheck-failures=%" PRIu64 "\n",
+               aggregate_mitm, aggregate_evals, aggregate_selfcheck);
+
+        if (global_top_n == 0) {
+            printf("No valid candidates survived any iteration.\n");
+        } else {
+            printf("\nTop %d results after %" PRIu64 " iterations:\n", global_top_n, completed_iterations);
+            for (int i = 0; i < global_top_n; ++i)
+                print_result(&global_top[i], i + 1);
+        }
+    } else {
+        printf("MITM matches (all constraints satisfied): %" PRIu64 "   fortress-evaluated: %" PRIu64 "\n",
+               aggregate_mitm, aggregate_evals);
+        printf("LUT self-check failures (should be 0): %" PRIu64 "\n", aggregate_selfcheck);
+
+        if (global_top_n == 0) {
+            printf("\nTop 0 results:\n");
+            printf("No candidates survived the MITM + placement/quadrant filter.\n");
+        } else {
+            printf("\nTop %d results:\n", global_top_n);
+            for (int i = 0; i < global_top_n; ++i)
+                print_result(&global_top[i], i + 1);
+        }
+    }
+
+    free_lut();
+    free_worker_vectors(ctxs, nthr);
+    for (int i = 0; i < nthr; ++i)
+        free(ctxs[i].v);
+    free(threads);
+    free(ctxs);
     return 0;
 }
