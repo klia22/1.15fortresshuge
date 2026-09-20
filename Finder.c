@@ -1,32 +1,14 @@
+/*
+Requirement
+rx has exactly 2 trailing ones	rx ≡ 3 (mod 8): 3, 11, 19, …
+or exactly 3 trailing ones	rx ≡ 7 (mod 16): 7, 23, …
+rz has at least 5 trailing ones	rz ≡ 31 (mod 32): 31, 63, 95, …
+
+Preset rx and rz do not meet these.
+*/
+
+
 #define _POSIX_C_SOURCE 200809L
-
-// megafortress_revised.c — 1.15 megafortress seed search.
-//
-// Finds world seeds ws such that the four fortresses in the 2x2 block of
-// regions {(0,0),(1,0),(0,1),(1,1)} each lie in the quadrant nearest the
-// shared corner (16,16 in chunk coordinates), i.e. they "meet".
-//
-// MITM: ws = H * 2^b + L.
-//   Phase 1 (L-side): for each L and each 4-bit carry pattern cp, compute
-//     the required Q mod 3 (must be identical across all four feeds) and the
-//     Q-range realizing cp. Entries are kept entirely in RAM.
-//   Phase 2 (H-side): for each H compute Q = A^2 * (H ^ MULT_hi) mod 2^(48-b),
-//     query the sorted LUT bucket by interval, and fully evaluate candidates.
-//
-// IMPORTANT SPLIT CONVENTION:
-//   b is the number of LOW bits allocated to the LUT side.
-//   Larger b => larger RAM LUT and smaller H scan.
-//   This intentionally prioritizes the cheap low bits, as requested.
-//
-// CLI:
-//   ./megafortress_revised --lut-bits 28 --threads 16
-//   ./megafortress_revised -b 28 -t 16
-//   Legacy positional form is also accepted: ./megafortress_revised 28 16
-//
-// Compile:
-//   gcc -O3 -march=native megafortress_revised.c -o megafortress_revised
-//       -lpthread -I<path-to-cubiomes>
-
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -46,8 +28,9 @@
 
 #define TOP_N 10
 #define REGION_COUNT 4
-#define LUT_BUCKETS 3
-#define MIN_FORTRESS_PIECES 150
+#define LUT_BUCKETS 3          // residue classes of Q2 mod 3
+#define CELLS_PER_DIM 16       // LUT grid resolution along Q3 (x pin) and Q4 (z pin)
+#define MIN_FORTRESS_PIECES 160
 #define CHUNK_BATCH 4096ULL
 #define H_BATCH 512ULL
 
@@ -57,28 +40,41 @@ static int g_corner_rz = 1;
 static uint64_t g_base_feed_delta = 16;
 static int g_test_mode;
 
-// Desired quadrant, relative to the shared corner at chunk coordinate (16,16):
-//   d=0 (0,0): x high, z high
-//   d=1 (1,0): x low,  z high
-//   d=2 (0,1): x high, z low
-//   d=3 (1,1): x low,  z low
-static const int X_HIGH[REGION_COUNT] = {1, 0, 1, 0};
-static const int Z_HIGH[REGION_COUNT] = {1, 1, 0, 0};
+// ----- Required fortress start offsets (the nextInt(8) x/z draws) -----
+// g_pin_x[d] / g_pin_z[d] in 0..7 pins that region's offset to exactly that value
+// and it is enforced INSIDE the MITM LUT.  -1 means "any value".
+// Region index d: 0=(rx,rz) "lo", 1=(rx+1,rz), 2=(rx,rz+1), 3=(rx+1,rz+1) "hi".
+// Default: all four regions pinned to their outer-most (corner) offsets:
+//   region 0 (rx,rz)     -> offset (0,0)
+//   region 1 (rx+1,rz)   -> offset (7,0)
+//   region 2 (rx,rz+1)   -> offset (0,7)
+//   region 3 (rx+1,rz+1) -> offset (7,7)
+static int g_pin_x[REGION_COUNT] = {7, 0, 7, 0};
+static int g_pin_z[REGION_COUNT] = {7, 7, 0, 0};
 
 static int      g_b;
 static uint64_t g_lower_size;
 static uint64_t g_upper_size;
 static uint64_t g_lower_mask;
 static uint64_t g_upper_mask;
+static uint64_t g_W;            // upper_size / 8 : width of one "top 3 bits" bin
 static int      g_sc;
 static int      g_sc_inv;
 static int      g_pc;
-static uint64_t g_Ak[4], g_Bk[4];
+static uint64_t g_Ak[5], g_Bk[5];
+static int      g_use_x, g_use_z;
+static int      g_G3, g_G4;      // grid cells along Q3 / Q4 (1 if that axis is unpinned)
+static uint64_t g_cellw3, g_cellw4;
+static size_t   g_nb;            // total LUT buckets = 3 * G3 * G4
 
 typedef struct {
     uint32_t L;
-    uint32_t rlo;
+    uint32_t rlo;   // valid Q2 range (carry pattern + residue class)
     uint32_t rhi;
+    uint32_t s3;    // valid Q3 arc: (Q3 - s3) mod U < len3   (x-offset pins)
+    uint32_t len3;
+    uint32_t s4;    // valid Q4 arc: (Q4 - s4) mod U < len4   (z-offset pins)
+    uint32_t len4;
 } LEntry;
 
 typedef struct {
@@ -93,7 +89,7 @@ typedef struct {
     size_t count;
 } LutBucket;
 
-static LutBucket g_lut[LUT_BUCKETS];
+static LutBucket *g_lut;
 static uint64_t g_lut_entries = 0;
 static uint64_t g_lut_bytes = 0;
 
@@ -105,6 +101,7 @@ static atomic_uint_fast64_t g_p1_done;
 static atomic_uint_fast64_t g_p2_done;
 static atomic_uint_fast64_t g_mitm_seeds;
 static atomic_uint_fast64_t g_total_evals;
+static atomic_uint_fast64_t g_selfcheck_fail;
 static atomic_uint_fast64_t g_test_queries;
 static atomic_uint_fast64_t g_test_matches;
 static atomic_uint_fast64_t g_test_lookup_ns;
@@ -161,7 +158,7 @@ typedef struct {
 } CandidateSummary;
 
 typedef struct {
-    EntryVec v[LUT_BUCKETS];
+    EntryVec *v;               // g_nb vectors, one per LUT bucket
     SearchResult top[TOP_N];
     int top_n;
     uint64_t local_evals;
@@ -226,7 +223,8 @@ static uint64_t monotonic_ns(void)
 static void vec_push(EntryVec *v, LEntry e)
 {
     if (v->count == v->cap) {
-        size_t nc = v->cap ? v->cap * 2 : 65536;
+        // Small start: there are hundreds of buckets per thread now.
+        size_t nc = v->cap ? v->cap * 2 : 64;
         if (nc < v->cap || nc > SIZE_MAX / sizeof(LEntry))
             die("LUT vector size overflow");
         v->data = (LEntry *)xrealloc(v->data, nc * sizeof(LEntry));
@@ -243,8 +241,13 @@ static void vec_push(EntryVec *v, LEntry e)
 // handled instead of assuming {0,1,16,17}.
 static void setup_corner(int rx, int rz)
 {
-    if (rx < 0 || rz < 0 || rx == INT_MAX || rz > (INT_MAX - 1) / 16)
-        die("corner region coordinates must be non-negative and safely fit in signed int math");
+    // Negative regions are fine (cx>>4 is an arithmetic shift, so the region index is
+    // sign-extended exactly like the game does).  The one exception is a 2x2 block that
+    // straddles 0 (rx == -1 or rz == -1): the feed delta then flips ALL high bits, which
+    // the shared-H MITM cannot represent, and setup() rejects it.
+    if (rx == INT_MAX || rx < -(INT_MAX / 32) || rx > INT_MAX / 32 ||
+        rz == INT_MAX || rz < -(INT_MAX / 32) || rz > INT_MAX / 32)
+        die("corner region coordinates are too large for the chunk-coordinate int math");
 
     g_corner_rx = rx;
     g_corner_rz = rz;
@@ -269,13 +272,20 @@ static void setup(int bits)
     g_upper_size = 1ULL << (48 - g_b);
     g_lower_mask = g_lower_size - 1;
     g_upper_mask = g_upper_size - 1;
+    g_W = g_upper_size >> 3;
 
     if (g_lower_size == 0 || g_upper_size == 0)
         die("internal split size became zero");
 
+    // eval assumes the region deltas only touch the LOW b bits (the H side is
+    // shared by all four regions).  Make that explicit instead of silently wrong.
+    for (int d = 0; d < REGION_COUNT; ++d)
+        if (g_feed_deltas[d] >= g_lower_size)
+            die("corner too large for this --lut-bits: feed deltas must fit in the low bits");
+
     g_Ak[0] = 1;
     g_Bk[0] = 0;
-    for (int i = 1; i <= 3; ++i) {
+    for (int i = 1; i <= 4; ++i) {
         g_Ak[i] = (g_Ak[i-1] * MULT) & MASK48;
         g_Bk[i] = (g_Bk[i-1] * MULT + ADD) & MASK48;
     }
@@ -290,60 +300,168 @@ static void setup(int bits)
     for (int i = 0; i < 48 - g_b; ++i)
         t = (t * 2) % 3;
     g_pc = t;
+
+    // Offset pins -> extra LUT dimensions.
+    g_use_x = g_use_z = 0;
+    for (int d = 0; d < REGION_COUNT; ++d) {
+        if (g_pin_x[d] >= 0) g_use_x = 1;
+        if (g_pin_z[d] >= 0) g_use_z = 1;
+    }
+    g_G3 = g_use_x ? CELLS_PER_DIM : 1;
+    g_G4 = g_use_z ? CELLS_PER_DIM : 1;
+    g_cellw3 = g_upper_size / (uint64_t)g_G3;
+    g_cellw4 = g_upper_size / (uint64_t)g_G4;
+    g_nb = (size_t)LUT_BUCKETS * (size_t)g_G3 * (size_t)g_G4;
 }
 
-// L-side test for one (L, cp).
-// Returns 1 if valid and fills req/rlo/rhi.
-static int eval_L(uint64_t L, int cp, int *req, uint32_t *rlo, uint32_t *rhi)
+// ----- Cyclic arcs in Z_U (U = upper_size), used for the offset pins -----
+// A pin "top 3 bits of state_k == v" for region d becomes, on the shared H-side
+// value Qk = (A_k * Hx) mod U, the arc  Qk in [v*W - phi_k,d , v*W - phi_k,d + W)  (mod U),
+// where phi_k,d is the high part of the L-side contribution.  Several regions'
+// arcs are intersected here so the LUT stores ONE arc per L.
+typedef struct {
+    uint64_t start;
+    uint64_t len;
+} Arc;
+
+// Intersect *cur with [start, start+len) (mod U). Valid because each arc is
+// shorter than U/2, so the intersection is a single piece. Returns 0 if empty.
+static int arc_and(Arc *cur, int *have, uint64_t start, uint64_t len)
+{
+    if (!*have) {
+        cur->start = start;
+        cur->len = len;
+        *have = 1;
+        return 1;
+    }
+    uint64_t delta = (start - cur->start) & g_upper_mask;
+    int64_t cl = (int64_t)cur->len;
+    int64_t nl = (int64_t)len;
+    for (int k = 0; k < 2; ++k) {
+        int64_t s = (int64_t)delta - (k ? (int64_t)g_upper_size : 0);
+        int64_t lo = s > 0 ? s : 0;
+        int64_t hi = (s + nl - 1 < cl - 1) ? (s + nl - 1) : (cl - 1);
+        if (lo <= hi) {
+            cur->start = (cur->start + (uint64_t)lo) & g_upper_mask;
+            cur->len = (uint64_t)(hi - lo + 1);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Which grid cells (of G equal cells over [0,U)) does the arc touch?
+static void arc_cells(const Arc *a, int G, int *first, int *count)
+{
+    if (G == 1) {
+        *first = 0;
+        *count = 1;
+        return;
+    }
+    uint64_t w = g_upper_size / (uint64_t)G;
+    uint64_t c0 = a->start / w;
+    uint64_t c1 = ((a->start + a->len - 1) & g_upper_mask) / w;
+    *first = (int)c0;
+    *count = (int)((c1 + (uint64_t)G - c0) % (uint64_t)G) + 1;
+}
+
+static inline int entry_arcs_ok(const LEntry *e, uint64_t Q3, uint64_t Q4)
+{
+    return ((Q3 - e->s3) & g_upper_mask) < e->len3 &&
+           ((Q4 - e->s4) & g_upper_mask) < e->len4;
+}
+
+// L-side work for one L: applies the nextInt(3)==0 constraints (via carry
+// patterns) AND the x/z offset pins, then stores entries in the LUT buckets.
+static void emit_L(uint64_t L, EntryVec *vecs)
 {
     uint64_t P2[REGION_COUNT];
+    Arc ax = {0, g_upper_size}, az = {0, g_upper_size};
+    int have_x = 0, have_z = 0;
 
     for (int d = 0; d < REGION_COUNT; ++d) {
-        uint64_t Pl = L ^ (uint64_t)g_feed_deltas[d] ^ (MULT & g_lower_mask);
-        P2[d] = (g_Ak[2] * Pl + g_Bk[2]) & MASK48;
-    }
+        uint64_t Lx = L ^ (uint64_t)g_feed_deltas[d] ^ (MULT & g_lower_mask);
+        P2[d] = (g_Ak[2] * Lx + g_Bk[2]) & MASK48;
 
-    int req_d[REGION_COUNT];
-    for (int d = 0; d < REGION_COUNT; ++d) {
-        uint64_t lo = P2[d] & g_lower_mask;
-        uint64_t hi = P2[d] >> g_b;
-        int Lc = (int)(((lo >> 17) % 3 + (uint64_t)g_sc * (hi % 3)) % 3);
-        int cd = (cp >> d) & 1;
-        int r = (-g_sc_inv * Lc + g_pc * cd) % 3;
-        if (r < 0)
-            r += 3;
-        req_d[d] = r;
-    }
-
-    for (int d = 1; d < REGION_COUNT; ++d) {
-        if (req_d[d] != req_d[0])
-            return 0;
-    }
-
-    // Carry c_d = 1 iff Q >= T_d, where T_d = upper_size - P2_hi.
-    uint64_t lo_q = 0;
-    uint64_t hi_q = g_upper_size - 1;
-
-    for (int d = 0; d < REGION_COUNT; ++d) {
-        uint64_t phi = P2[d] >> g_b;
-        uint64_t T = g_upper_size - phi;
-        if ((cp >> d) & 1) {
-            if (T > lo_q)
-                lo_q = T;
-        } else {
-            // T is in [1, upper_size] because phi < upper_size.
-            if (T - 1 < hi_q)
-                hi_q = T - 1;
+        if (g_pin_x[d] >= 0) {
+            // state after 3 LCG steps; its top 3 bits are the x offset
+            uint64_t phi3 = ((g_Ak[3] * Lx + g_Bk[3]) & MASK48) >> g_b;
+            uint64_t start = ((uint64_t)g_pin_x[d] * g_W + g_upper_size - phi3) & g_upper_mask;
+            if (!arc_and(&ax, &have_x, start, g_W))
+                return;
+        }
+        if (g_pin_z[d] >= 0) {
+            // state after 4 LCG steps; its top 3 bits are the z offset
+            uint64_t phi4 = ((g_Ak[4] * Lx + g_Bk[4]) & MASK48) >> g_b;
+            uint64_t start = ((uint64_t)g_pin_z[d] * g_W + g_upper_size - phi4) & g_upper_mask;
+            if (!arc_and(&az, &have_z, start, g_W))
+                return;
         }
     }
 
-    if (lo_q > hi_q)
-        return 0;
+    int c3first, c3n, c4first, c4n;
+    arc_cells(&ax, g_G3, &c3first, &c3n);
+    arc_cells(&az, g_G4, &c4first, &c4n);
 
-    *req = req_d[0];
-    *rlo = (uint32_t)lo_q;
-    *rhi = (uint32_t)hi_q;
-    return 1;
+    for (int cp = 0; cp < 16; ++cp) {
+        int req_d[REGION_COUNT];
+        for (int d = 0; d < REGION_COUNT; ++d) {
+            uint64_t lo = P2[d] & g_lower_mask;
+            uint64_t hi = P2[d] >> g_b;
+            int Lc = (int)(((lo >> 17) % 3 + (uint64_t)g_sc * (hi % 3)) % 3);
+            int cd = (cp >> d) & 1;
+            int r = (-g_sc_inv * Lc + g_pc * cd) % 3;
+            if (r < 0)
+                r += 3;
+            req_d[d] = r;
+        }
+
+        int same = 1;
+        for (int d = 1; d < REGION_COUNT; ++d) {
+            if (req_d[d] != req_d[0]) { same = 0; break; }
+        }
+        if (!same)
+            continue;
+
+        // Carry c_d = 1 iff Q2 >= T_d, where T_d = upper_size - P2_hi.
+        uint64_t lo_q = 0;
+        uint64_t hi_q = g_upper_size - 1;
+
+        for (int d = 0; d < REGION_COUNT; ++d) {
+            uint64_t phi = P2[d] >> g_b;
+            uint64_t T = g_upper_size - phi;
+            if ((cp >> d) & 1) {
+                if (T > lo_q)
+                    lo_q = T;
+            } else {
+                // T is in [1, upper_size] because phi < upper_size.
+                if (T - 1 < hi_q)
+                    hi_q = T - 1;
+            }
+        }
+
+        if (lo_q > hi_q)
+            continue;
+
+        LEntry en;
+        en.L = (uint32_t)L;
+        en.rlo = (uint32_t)lo_q;
+        en.rhi = (uint32_t)hi_q;
+        en.s3 = (uint32_t)ax.start;
+        en.len3 = (uint32_t)ax.len;
+        en.s4 = (uint32_t)az.start;
+        en.len4 = (uint32_t)az.len;
+
+        int req = req_d[0];
+        for (int i3 = 0; i3 < c3n; ++i3) {
+            int c3 = (c3first + i3) % g_G3;
+            for (int i4 = 0; i4 < c4n; ++i4) {
+                int c4 = (c4first + i4) % g_G4;
+                size_t idx = ((size_t)req * (size_t)g_G3 + (size_t)c3) * (size_t)g_G4 + (size_t)c4;
+                vec_push(&vecs[idx], en);
+            }
+        }
+    }
 }
 
 static void *phase1_worker(void *arg)
@@ -363,17 +481,7 @@ static void *phase1_worker(void *arg)
         for (uint64_t L = s; L < e; ++L) {
             if (g_stop_requested)
                 break;
-            for (int cp = 0; cp < 16; ++cp) {
-                int req;
-                uint32_t rlo, rhi;
-                if (eval_L(L, cp, &req, &rlo, &rhi)) {
-                    LEntry en;
-                    en.L = (uint32_t)L;
-                    en.rlo = rlo;
-                    en.rhi = rhi;
-                    vec_push(&ctx->v[req], en);
-                }
-            }
+            emit_L(L, ctx->v);
             atomic_fetch_add_explicit(&g_p1_done, 1, memory_order_relaxed);
         }
     }
@@ -397,7 +505,11 @@ static int cmp_lut_entry(const void *pa, const void *pb)
 static void build_lut(WorkerCtx *ctxs, int nthr)
 {
     atomic_store_explicit(&g_phase, 2, memory_order_relaxed);
-    for (int r = 0; r < LUT_BUCKETS; ++r) {
+    g_lut = (LutBucket *)xcalloc(g_nb, sizeof(LutBucket));
+    g_lut_entries = 0;
+    g_lut_bytes = 0;
+
+    for (size_t r = 0; r < g_nb; ++r) {
         uint64_t total = 0;
         for (int t = 0; t < nthr; ++t)
             total += (uint64_t)ctxs[t].v[r].count;
@@ -433,11 +545,9 @@ static void build_lut(WorkerCtx *ctxs, int nthr)
                 g_lut[r].prefix_max_rhi[i] = mx;
             }
         }
-    }
 
-    for (int r = 0; r < LUT_BUCKETS; ++r) {
-        g_lut_bytes += (uint64_t)g_lut[r].count * sizeof(LEntry);
-        g_lut_bytes += (uint64_t)g_lut[r].count * sizeof(uint32_t);
+        g_lut_entries += (uint64_t)g_lut[r].count;
+        g_lut_bytes += (uint64_t)g_lut[r].count * (sizeof(LEntry) + sizeof(uint32_t));
     }
 }
 
@@ -454,8 +564,10 @@ static size_t upper_bound_rlo(const LutBucket *b, uint32_t q)
     return lo;
 }
 
-typedef void (*lut_match_cb)(uint32_t L, void *opaque);
+typedef void (*lut_match_cb)(const LEntry *e, void *opaque);
 
+// Calls cb for every entry in the bucket whose Q2 range contains q.
+// (The Q3/Q4 arc test is done by the callback via entry_arcs_ok().)
 static void lut_query(const LutBucket *b, uint32_t q, lut_match_cb cb, void *opaque)
 {
     if (b->count == 0)
@@ -476,7 +588,7 @@ static void lut_query(const LutBucket *b, uint32_t q, lut_match_cb cb, void *opa
         if (b->data[i].rhi >= q) {
             if (g_test_mode)
                 atomic_fetch_add_explicit(&g_test_matches, 1, memory_order_relaxed);
-            cb(b->data[i].L, opaque);
+            cb(&b->data[i], opaque);
         }
         if (g_stop_requested)
             break;
@@ -492,7 +604,24 @@ static void lut_query(const LutBucket *b, uint32_t q, lut_match_cb cb, void *opa
                 monotonic_ns() - query_start, memory_order_relaxed);
 }
 
+// H-side values for one H: Q2/Q3/Q4 and the LUT bucket they select.
+static inline size_t h_bucket(uint64_t H, uint64_t *Q3, uint64_t *Q4, uint64_t *Q2out)
+{
+    uint64_t Hx = H ^ (MULT >> g_b);
+    uint64_t Q2 = (g_Ak[2] * Hx) & g_upper_mask;
+    *Q3 = (g_Ak[3] * Hx) & g_upper_mask;
+    *Q4 = (g_Ak[4] * Hx) & g_upper_mask;
+    *Q2out = Q2;
+    size_t r = (size_t)(Q2 % 3);
+    size_t c3 = g_G3 == 1 ? 0 : (size_t)(*Q3 / g_cellw3);
+    size_t c4 = g_G4 == 1 ? 0 : (size_t)(*Q4 / g_cellw4);
+    return (r * (size_t)g_G3 + c3) * (size_t)g_G4 + c4;
+}
+
 // ----- Fortress evaluation -----
+// Full (exact) check of nextInt(3)==0 and the pinned offsets for one candidate,
+// then the expensive fortress generation.  With the pins folded into the LUT the
+// two self-checks below should never fire; they only guard against LUT bugs.
 static int summarize_candidate(uint64_t base_feed, CandidateSummary *out)
 {
     memset(out, 0, sizeof(*out));
@@ -506,18 +635,21 @@ static int summarize_candidate(uint64_t base_feed, CandidateSummary *out)
 
         s = lcg(s);                         // setAttemptSeed(): next(31)
         s = lcg(s);                         // nextInt(3)
-        if (((s >> 17) % 3) != 0)
+        if (((s >> 17) % 3) != 0) {
+            atomic_fetch_add_explicit(&g_selfcheck_fail, 1, memory_order_relaxed);
             return 0;
+        }
 
         s = lcg(s);                         // nextInt(8) for x
-        int xv = (int)((s >> 45) & 7);
+        int xv = (int)(s >> 45);
         s = lcg(s);                         // nextInt(8) for z
-        int zv = (int)((s >> 45) & 7);
+        int zv = (int)(s >> 45);
 
-        if (X_HIGH[d] ? (xv < 4) : (xv >= 4))
+        if ((g_pin_x[d] >= 0 && xv != g_pin_x[d]) ||
+            (g_pin_z[d] >= 0 && zv != g_pin_z[d])) {
+            atomic_fetch_add_explicit(&g_selfcheck_fail, 1, memory_order_relaxed);
             return 0;
-        if (Z_HIGH[d] ? (zv < 4) : (zv >= 4))
-            return 0;
+        }
 
         int rx = g_corner_rx + ((d == 1 || d == 3) ? 1 : 0);
         int rz = g_corner_rz + ((d == 2 || d == 3) ? 1 : 0);
@@ -649,22 +781,30 @@ static void top_insert(SearchResult *top, int *top_n, const SearchResult *cand)
 }
 
 // ----- Phase 2 -----
-// We do not use the generic callback above; phase2 keeps H in a local context.
 typedef struct {
     WorkerCtx *ctx;
     uint64_t H;
+    uint64_t Q3;
+    uint64_t Q4;
 } CandidateCallbackCtx;
 
-static void evaluate_one_L(uint32_t L, void *opaque)
+static void evaluate_one_L(const LEntry *e, void *opaque)
 {
     if (g_stop_requested)
         return;
 
+    CandidateCallbackCtx *cc = (CandidateCallbackCtx *)opaque;
+
+    // Grid cells are coarse, so finish the exact x/z arc test here.  This is a
+    // couple of integer ops on an entry that already passed the LUT, not a
+    // per-seed LCG replay.
+    if (!entry_arcs_ok(e, cc->Q3, cc->Q4))
+        return;
+
     atomic_fetch_add_explicit(&g_mitm_seeds, 1, memory_order_relaxed);
 
-    CandidateCallbackCtx *cc = (CandidateCallbackCtx *)opaque;
     WorkerCtx *ctx = cc->ctx;
-    uint64_t base_feed = (cc->H << g_b) | (uint64_t)L;
+    uint64_t base_feed = (cc->H << g_b) | (uint64_t)e->L;
 
     CandidateSummary sum;
     uint64_t fortress_start = g_test_mode ? monotonic_ns() : 0;
@@ -704,11 +844,12 @@ static void *phase2_worker(void *arg)
         for (uint64_t H = s; H < e; ++H) {
             if (g_stop_requested)
                 break;
-            uint64_t Q2 = (g_Ak[2] * (H ^ (MULT >> g_b))) & g_upper_mask;
-            int r = (int)(Q2 % 3);
-            const LutBucket *bucket = &g_lut[r];
+            uint64_t Q2, Q3, Q4;
+            size_t idx = h_bucket(H, &Q3, &Q4, &Q2);
             cbctx.H = H;
-            lut_query(bucket, (uint32_t)Q2, evaluate_one_L, &cbctx);
+            cbctx.Q3 = Q3;
+            cbctx.Q4 = Q4;
+            lut_query(&g_lut[idx], (uint32_t)Q2, evaluate_one_L, &cbctx);
             atomic_fetch_add_explicit(&g_p2_done, 1, memory_order_relaxed);
         }
     }
@@ -779,23 +920,23 @@ static void *monitor_thread(void *arg)
 
         static uint64_t last_evals = 0;
         static double last_eval_t = 0.0;
-         static uint64_t last_mitm_seeds = 0;
-         static double last_mitm_t = 0.0;
+        static uint64_t last_mitm_seeds = 0;
+        static double last_mitm_t = 0.0;
         double eval_dt = now - last_eval_t;
         uint64_t eval_rate_count = evals - last_evals;
         double eval_rate = eval_dt > 0.0 ? (double)eval_rate_count / eval_dt : 0.0;
         last_evals = evals;
         last_eval_t = now;
-         double mitm_dt = now - last_mitm_t;
-         uint64_t mitm_rate_count = mitm_seeds - last_mitm_seeds;
-         double mitm_rate = mitm_dt > 0.0 ? (double)mitm_rate_count / mitm_dt : 0.0;
-         last_mitm_seeds = mitm_seeds;
-         last_mitm_t = now;
+        double mitm_dt = now - last_mitm_t;
+        uint64_t mitm_rate_count = mitm_seeds - last_mitm_seeds;
+        double mitm_rate = mitm_dt > 0.0 ? (double)mitm_rate_count / mitm_dt : 0.0;
+        last_mitm_seeds = mitm_seeds;
+        last_mitm_t = now;
 
-         printf("[%7.1fs] %-20s H=%12" PRIu64 "/%-12" PRIu64 " %6.2f%%  H/s=%10.1f  seeds/s=%10.1f  valid4/s=%10.1f  seeds=%" PRIu64 " valid4=%" PRIu64 "\n",
+        printf("[%7.1fs] %-20s H=%12" PRIu64 "/%-12" PRIu64 " %6.2f%%  H/s=%10.1f  seeds/s=%10.1f  valid4/s=%10.1f  seeds=%" PRIu64 " valid4=%" PRIu64 "\n",
                now, label, work, total,
                total ? 100.0 * (double)work / (double)total : 100.0,
-             rate, mitm_rate, eval_rate, mitm_seeds, evals);
+               rate, mitm_rate, eval_rate, mitm_seeds, evals);
         fflush(stdout);
 
         if (phase == 4)
@@ -808,14 +949,24 @@ static void *monitor_thread(void *arg)
 // ----- Printing -----
 static void print_usage(const char *argv0)
 {
-    printf("Usage: %s [--lut-bits N] [--threads N] [--corner-rx N] [--corner-rz N] [--test]\n", argv0);
+    printf("Usage: %s [--lut-bits N] [--threads N] [--corner-rx N] [--corner-rz N]\n", argv0);
+    printf("          [--pin D X Z]... [--no-pin] [--test]\n");
     printf("       %s N THREADS        (legacy positional form)\n\n", argv0);
     printf("  --lut-bits, -b N   Number of LOW bits placed in the MITM LUT [20..32].\n");
     printf("                     Larger N = larger RAM LUT, smaller H scan.\n");
     printf("  --threads, -t N    Worker thread count [1..256].\n");
-    printf("  --corner-rx N      Base region X for the 2x2 corner. Default 0.\n");
-    printf("  --corner-rz N      Base region Z for the 2x2 corner. Default 1.\n");
-    printf("  --test              Measure MITM lookup time versus fortress evaluation time.\n");
+    printf("  --corner-rx N      Base region X (chunk>>4) for the 2x2 block. Default 0.\n");
+    printf("  --corner-rz N      Base region Z (chunk>>4) for the 2x2 block. Default 1.\n");
+    printf("                     Only the number of trailing 1-bits of rx / rz matters for\n");
+    printf("                     satisfiability. With the default 4 pins it needs rx = 3 mod 8\n");
+    printf("                     or 7 mod 16, and rz = 31 mod 32 (negative values are allowed;\n");
+    printf("                     rx/rz = -1 is not supported).\n");
+    printf("  --pin D X Z        Require region D (0=(rx,rz) lo, 1=(rx+1,rz), 2=(rx,rz+1),\n");
+    printf("                     3=(rx+1,rz+1) hi) to have fortress offset (X,Z), each 0..7\n");
+    printf("                     or -1 for any. Enforced inside the LUT. Default:\n");
+    printf("                     --pin 0 0 0 --pin 1 7 0 --pin 2 0 7 --pin 3 7 7.\n");
+    printf("  --no-pin           Clear all offset pins (previous behaviour).\n");
+    printf("  --test             Measure MITM lookup time versus fortress evaluation time.\n");
     printf("                     Corner (0,0) gives deltas {0,1,16,17}; that corner's\n");
     printf("                     four-way nextInt(3)==0 filter is unsatisfiable, so it\n");
     printf("                     is useful as a sanity-check but not a search target.\n");
@@ -883,6 +1034,20 @@ int main(int argc, char **argv)
             } else if (!strcmp(argv[i], "--corner-rz")) {
                 if (++i >= argc || !parse_int_arg(argv[i], &corner_rz))
                     die("invalid --corner-rz value");
+            } else if (!strcmp(argv[i], "--pin")) {
+                int d, px, pz;
+                if (i + 3 >= argc ||
+                    !parse_int_arg(argv[i + 1], &d) ||
+                    !parse_int_arg(argv[i + 2], &px) ||
+                    !parse_int_arg(argv[i + 3], &pz) ||
+                    d < 0 || d >= REGION_COUNT || px < -1 || px > 7 || pz < -1 || pz > 7)
+                    die("--pin needs: D in 0..3, X in -1..7, Z in -1..7");
+                g_pin_x[d] = px;
+                g_pin_z[d] = pz;
+                i += 3;
+            } else if (!strcmp(argv[i], "--no-pin")) {
+                for (int d = 0; d < REGION_COUNT; ++d)
+                    g_pin_x[d] = g_pin_z[d] = -1;
             } else if (!strcmp(argv[i], "--test")) {
                 g_test_mode = 1;
             } else {
@@ -910,6 +1075,15 @@ int main(int argc, char **argv)
            (unsigned long long)g_feed_deltas[2],
            (unsigned long long)g_feed_deltas[3],
            (unsigned long long)g_base_feed_delta);
+    for (int d = 0; d < REGION_COUNT; ++d) {
+        printf("  region %d pin: x=", d);
+        if (g_pin_x[d] >= 0) printf("%d", g_pin_x[d]); else printf("any");
+        printf(" z=");
+        if (g_pin_z[d] >= 0) printf("%d", g_pin_z[d]); else printf("any");
+        printf("\n");
+    }
+    printf("LUT grid: %d x %d cells x %d residues = %zu buckets\n",
+           g_G3, g_G4, LUT_BUCKETS, g_nb);
 
     long cpu_count = 16;
     if (cpu_count > 0 && nthr > cpu_count * 4)
@@ -928,12 +1102,15 @@ int main(int argc, char **argv)
     atomic_init(&g_p2_done, 0);
     atomic_init(&g_mitm_seeds, 0);
     atomic_init(&g_total_evals, 0);
+    atomic_init(&g_selfcheck_fail, 0);
     atomic_init(&g_test_queries, 0);
     atomic_init(&g_test_matches, 0);
     atomic_init(&g_test_lookup_ns, 0);
     atomic_init(&g_test_fortress_ns, 0);
 
     WorkerCtx *ctxs = (WorkerCtx *)xcalloc((size_t)nthr, sizeof(WorkerCtx));
+    for (int i = 0; i < nthr; ++i)
+        ctxs[i].v = (EntryVec *)xcalloc(g_nb, sizeof(EntryVec));
     pthread_t *threads = (pthread_t *)xmalloc((size_t)nthr * sizeof(pthread_t));
 
     pthread_t mon;
@@ -957,9 +1134,10 @@ int main(int argc, char **argv)
     }
 
     uint64_t raw_counts[LUT_BUCKETS] = {0, 0, 0};
-    for (int r = 0; r < LUT_BUCKETS; ++r) {
+    for (size_t r = 0; r < g_nb; ++r) {
+        size_t res = r / ((size_t)g_G3 * (size_t)g_G4);
         for (int i = 0; i < nthr; ++i)
-            raw_counts[r] += (uint64_t)ctxs[i].v[r].count;
+            raw_counts[res] += (uint64_t)ctxs[i].v[r].count;
     }
 
     printf("Phase 1 complete: raw entries req0=%" PRIu64 " req1=%" PRIu64 " req2=%" PRIu64 " total=%" PRIu64 "\n",
@@ -969,13 +1147,14 @@ int main(int argc, char **argv)
 
     g_lut_entries = raw_counts[0] + raw_counts[1] + raw_counts[2];
     if (g_lut_entries == 0) {
-        printf("LUT is empty: the four placement constraints are unsatisfiable for this corner/delta class.\n");
-        printf("No H seeds will be scanned. Choose another --corner-rx/--corner-rz.\n");
+        printf("LUT is empty: the placement constraints (nextInt(3) + pinned offsets) are unsatisfiable for this corner/pin set.\n");
+        printf("No H seeds will be scanned. Choose another --corner-rx/--corner-rz or different --pin values.\n");
         atomic_store_explicit(&g_phase, 4, memory_order_relaxed);
         pthread_join(mon, NULL);
         for (int i = 0; i < nthr; ++i) {
-            for (int r = 0; r < LUT_BUCKETS; ++r)
+            for (size_t r = 0; r < g_nb; ++r)
                 free(ctxs[i].v[r].data);
+            free(ctxs[i].v);
         }
         free(threads);
         free(ctxs);
@@ -988,14 +1167,19 @@ int main(int argc, char **argv)
         pthread_join(mon, NULL);
         goto output_results;
     }
-    printf("LUT loaded in RAM: %" PRIu64 " entries, %.2f MiB incl. prefix index\n",
+    printf("LUT loaded in RAM: %" PRIu64 " entries (incl. grid replication), %.2f MiB incl. prefix index\n",
            g_lut_entries, (double)g_lut_bytes / (1024.0 * 1024.0));
-    for (int r = 0; r < LUT_BUCKETS; ++r)
-        printf("  bucket %d: %zu entries\n", r, g_lut[r].count);
+    for (int res = 0; res < LUT_BUCKETS; ++res) {
+        uint64_t n = 0;
+        size_t per = (size_t)g_G3 * (size_t)g_G4;
+        for (size_t k = 0; k < per; ++k)
+            n += g_lut[(size_t)res * per + k].count;
+        printf("  residue %d: %" PRIu64 " entries over %zu cells\n", res, n, per);
+    }
     fflush(stdout);
 
     // Sanity check sorting; catches accidental unsorted-table bugs immediately.
-    for (int r = 0; r < LUT_BUCKETS; ++r) {
+    for (size_t r = 0; r < g_nb; ++r) {
         for (size_t i = 1; i < g_lut[r].count; ++i) {
             if (cmp_lut_entry(&g_lut[r].data[i-1], &g_lut[r].data[i]) > 0)
                 die("internal error: LUT bucket is not sorted");
@@ -1038,6 +1222,10 @@ output_results:
         printf("  fortress evaluation:   %.3f s\n", (double)fortress_ns / 1e9);
         printf("  MITM overhead:         %.3f s\n", (double)mitm_ns / 1e9);
     }
+    printf("MITM matches (all constraints satisfied): %" PRIu64 "   fortress-evaluated: %" PRIu64 "\n",
+           atomic_load_u64(&g_mitm_seeds), atomic_load_u64(&g_total_evals));
+    printf("LUT self-check failures (should be 0): %" PRIu64 "\n",
+           atomic_load_u64(&g_selfcheck_fail));
 
     // Merge thread-local top 10 lists into one global top 10.
     SearchResult global_top[TOP_N];
@@ -1056,13 +1244,17 @@ output_results:
             print_result(&global_top[i], i + 1);
     }
 
-    for (int r = 0; r < LUT_BUCKETS; ++r) {
-        free(g_lut[r].data);
-        free(g_lut[r].prefix_max_rhi);
+    if (g_lut) {
+        for (size_t r = 0; r < g_nb; ++r) {
+            free(g_lut[r].data);
+            free(g_lut[r].prefix_max_rhi);
+        }
+        free(g_lut);
     }
     for (int i = 0; i < nthr; ++i) {
-        for (int r = 0; r < LUT_BUCKETS; ++r)
+        for (size_t r = 0; r < g_nb; ++r)
             free(ctxs[i].v[r].data);
+        free(ctxs[i].v);
     }
     free(threads);
     free(ctxs);
