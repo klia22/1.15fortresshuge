@@ -1,13 +1,3 @@
-/*
-Requirement
-rx has exactly 2 trailing ones	rx ≡ 3 (mod 8): 3, 11, 19, …
-or exactly 3 trailing ones	rx ≡ 7 (mod 16): 7, 23, …
-rz has at least 5 trailing ones	rz ≡ 31 (mod 32): 31, 63, 95, …
-
-Preset rx and rz do not meet these.
-*/
-
-
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdint.h>
@@ -30,10 +20,10 @@ Preset rx and rz do not meet these.
 #define REGION_COUNT 4
 #define LUT_BUCKETS 3          // residue classes of Q2 mod 3
 #define CELLS_PER_DIM 16       // LUT grid resolution along Q3 (x pin) and Q4 (z pin)
-#define MIN_FORTRESS_PIECES 100
+#define MIN_FORTRESS_PIECES 160
 #define CHUNK_BATCH 4096ULL
 #define H_BATCH 512ULL
-#define AUTO_STATE_COUNT 24
+#define AUTO_STATE_COUNT 18
 
 static uint64_t g_feed_deltas[REGION_COUNT] = {0, 1, 48, 49};
 static int g_corner_rx = 0;
@@ -126,10 +116,12 @@ static void free_lut(void)
 // ----- Automatic region states -----
 //
 // Automatic mode deliberately uses a fixed, precomputed list rather than
-// rediscovering valid delta signatures every run.  Inside the +/-30,000,000
-// block world border there are 24 distinct working RNG-delta signatures:
+// rediscovering valid delta signatures every run.  In the Nether, the
+// +/-30,000,000 overworld block world border corresponds to +/-3,750,000
+// Nether blocks. Since rx/rz are chunk>>4 region coordinates, the in-border
+// automatic search has 18 distinct working RNG-delta signatures:
 //   2 x-delta classes (0x07, 0x0f)
-//   12 z-delta classes (rz with 5..16 trailing one bits)
+//   9 z-delta classes (rz with 5..13 trailing one bits)
 //
 // Each entry below is one concrete representative corner for that signature.
 // Representatives are chosen safely inside the world border and distributed
@@ -162,12 +154,6 @@ static const AutoRegionState g_auto_states[AUTO_STATE_COUNT] = {
     {   -9,    4095, 0x00f, 0x01fff0 },
     {    3,    8191, 0x007, 0x03fff0 },
     {   -9,   -8193, 0x00f, 0x03fff0 },
-    {    3,  -16385, 0x007, 0x07fff0 },
-    {   -9,   16383, 0x00f, 0x07fff0 },
-    {    3,   32767, 0x007, 0x0ffff0 },
-    {   -9,  -32769, 0x00f, 0x0ffff0 },
-    {    3,  -65537, 0x007, 0x1ffff0 },
-    {   -9,   65535, 0x00f, 0x1ffff0 },
 };
 
 static int automatic_corner(uint64_t iteration, int *rx_out, int *rz_out)
@@ -1136,9 +1122,11 @@ static void print_usage(const char *argv0)
     printf("       %s [--lut-bits N] [--threads N] [--corner-rx N] [--corner-rz N]\n", argv0);
     printf("          [--pin D X Z]... [--no-pin] [--test]\n");
     printf("       %s N THREADS        (legacy positional form)\n\n", argv0);
-    printf("  --regions N         Run the first N of the 24 precomputed, known-good automatic\n");
-    printf("                     RNG-delta states inside the +/-30,000,000 block world border.\n");
-    printf("                     N must be in [1,24]. No delta-signature discovery or\n");
+    printf("  --regions N         Run the first N of the 18 precomputed, known-good automatic\n");
+    printf("                     RNG-delta states inside the Nether equivalent of the\n");
+    printf("                     +/-30,000,000 overworld block world border (/-3,750,000\n");
+    printf("                     to +3,750,000 Nether blocks per axis).\n");
+    printf("                     N must be in [1,18]. No delta-signature discovery or\n");
     printf("                     recalculation is performed in automatic mode.\n");
     printf("                     After all N searches, report the global top 10.\n");
     printf("  --lut-bits, -b N   Number of LOW bits placed in the MITM LUT [20..32].\n");
@@ -1299,9 +1287,9 @@ int main(int argc, char **argv)
     setup(bits);
 
     if (regions_flag_used && (regions < 1 || regions > AUTO_STATE_COUNT))
-        die("--regions must be between 1 and 24");
+        die("--regions must be between 1 and 18");
 
-    long cpu_count = 16;
+    long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
     if (cpu_count <= 0)
         cpu_count = 16;
     if (cpu_count > 0 && nthr > cpu_count * 4)
@@ -1316,7 +1304,7 @@ int main(int argc, char **argv)
         printf("Automatic region mode: %" PRIu64 " of %d precomputed states requested.\n",
                regions, AUTO_STATE_COUNT);
         printf("These are fixed, known-good delta signatures with concrete corners inside the\n");
-        printf("+/-30,000,000 block world border; automatic mode performs no signature discovery.\n");
+        printf("Nether +/-3,750,000 block equivalent of the +/-30,000,000 overworld border; automatic mode performs no signature discovery.\n");
         print_auto_states();
     } else {
         printf("Legacy single-corner mode: use --corner-rx/--corner-rz and pin flags for debugging.\n");
