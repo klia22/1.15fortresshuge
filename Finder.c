@@ -30,13 +30,10 @@ Preset rx and rz do not meet these.
 #define REGION_COUNT 4
 #define LUT_BUCKETS 3          // residue classes of Q2 mod 3
 #define CELLS_PER_DIM 16       // LUT grid resolution along Q3 (x pin) and Q4 (z pin)
-#define MIN_FORTRESS_PIECES 160
+#define MIN_FORTRESS_PIECES 100
 #define CHUNK_BATCH 4096ULL
 #define H_BATCH 512ULL
-#define AUTO_RX_OPTIONS 2
-#define AUTO_RX_2TRAIL  3   // rx = 3 (mod 8): rx ^ (rx+1) == 0x07
-#define AUTO_RX_3TRAIL  7   // rx = 7 (mod 16): rx ^ (rx+1) == 0x0f
-#define AUTO_RZ_MIN_TRAIL 5 // rz may have any number of trailing ones >= 5
+#define AUTO_STATE_COUNT 24
 
 static uint64_t g_feed_deltas[REGION_COUNT] = {0, 1, 48, 49};
 static int g_corner_rx = 0;
@@ -126,148 +123,76 @@ static void free_lut(void)
     g_lut_bytes = 0;
 }
 
-// ----- Automatic corner enumeration -----
+// ----- Automatic region states -----
 //
-// With the default four pins, valid corners have either
-//   rx = 3 (mod 8)   -> rx ^ (rx+1) = 0x07
-//   rx = 7 (mod 16)  -> rx ^ (rx+1) = 0x0f
-// and rz with at least five trailing one bits.  For a fixed trailing-one
-// count t, every rz = (2^t - 1) + k*2^(t+1) preserves the same z delta.
-// Likewise, stepping rx by 8 or 16 preserves its x delta class.
+// Automatic mode deliberately uses a fixed, precomputed list rather than
+// rediscovering valid delta signatures every run.  Inside the +/-30,000,000
+// block world border there are 24 distinct working RNG-delta signatures:
+//   2 x-delta classes (0x07, 0x0f)
+//   12 z-delta classes (rz with 5..16 trailing one bits)
 //
-// There are only a limited number of distinct RNG-delta signatures, but there
-// are vastly more distinct absolute corners.  Automatic mode therefore uses a
-// round-robin enumeration: the first round contains one corner for every
-// distinct signature, and later rounds continue with fresh absolute corners.
-// This makes --regions 100, 1000, etc. useful instead of imposing an arbitrary
-// 44-iteration ceiling.
-static uint64_t automatic_max_trailing(void)
-{
-    const uint64_t max_region = (uint64_t)(INT_MAX / 32);
-    uint64_t coord_max = 0;
-    while (coord_max < 62 &&
-           ((UINT64_C(1) << (coord_max + 1)) - 1) <= max_region)
-        ++coord_max;
+// Each entry below is one concrete representative corner for that signature.
+// Representatives are chosen safely inside the world border and distributed
+// across all four sign quadrants.  The absolute corner is significant when
+// converting a discovered 48-bit RNG/world seed back to world coordinates,
+// while the delta signature is what determines the MITM relationship.
+typedef struct {
+    int rx;
+    int rz;
+    uint32_t dx;
+    uint32_t dz;
+} AutoRegionState;
 
-    uint64_t lut_max = (uint64_t)g_b - 5;
-    return lut_max < coord_max ? lut_max : coord_max;
-}
-
-static uint64_t automatic_signature_count(void)
-{
-    const uint64_t max_trailing = automatic_max_trailing();
-    if (max_trailing < AUTO_RZ_MIN_TRAIL)
-        return 0;
-    return 2 * (max_trailing - AUTO_RZ_MIN_TRAIL + 1);
-}
-
-static uint64_t automatic_signature_capacity(uint64_t sig)
-{
-    const uint64_t max_region = (uint64_t)(INT_MAX / 32);
-    const uint64_t trail = AUTO_RZ_MIN_TRAIL + sig / 2;
-    const uint64_t rx_base = (sig & 1) ? AUTO_RX_3TRAIL : AUTO_RX_2TRAIL;
-    const uint64_t rx_step = (rx_base == AUTO_RX_2TRAIL) ? 8 : 16;
-    const uint64_t rz_base = (UINT64_C(1) << trail) - 1;
-    const uint64_t rz_step = UINT64_C(1) << (trail + 1);
-
-    if (rx_base > max_region || rz_base > max_region)
-        return 0;
-
-    const uint64_t rx_count = (max_region - rx_base) / rx_step + 1;
-    const uint64_t rz_count = (max_region - rz_base) / rz_step + 1;
-    if (rx_count != 0 && rz_count > UINT64_MAX / rx_count)
-        return UINT64_MAX;
-    return rx_count * rz_count;
-}
-
-static uint64_t automatic_corner_capacity(void)
-{
-    const uint64_t sig_count = automatic_signature_count();
-    uint64_t total = 0;
-    for (uint64_t sig = 0; sig < sig_count; ++sig) {
-        const uint64_t n = automatic_signature_capacity(sig);
-        if (UINT64_MAX - total < n)
-            return UINT64_MAX;
-        total += n;
-    }
-    return total;
-}
-
-// Number of corners contributed by all signatures in rounds [0, round).
-static uint64_t automatic_count_before_round(uint64_t round, uint64_t sig_count)
-{
-    uint64_t total = 0;
-    for (uint64_t sig = 0; sig < sig_count; ++sig) {
-        const uint64_t cap = automatic_signature_capacity(sig);
-        const uint64_t add = round < cap ? round : cap;
-        if (UINT64_MAX - total < add)
-            return UINT64_MAX;
-        total += add;
-    }
-    return total;
-}
+static const AutoRegionState g_auto_states[AUTO_STATE_COUNT] = {
+    {    3,      31, 0x007, 0x0003f0 },
+    {   -9,     -33, 0x00f, 0x0003f0 },
+    {    3,     -65, 0x007, 0x0007f0 },
+    {   -9,      63, 0x00f, 0x0007f0 },
+    {    3,     127, 0x007, 0x000ff0 },
+    {   -9,    -129, 0x00f, 0x000ff0 },
+    {    3,    -257, 0x007, 0x001ff0 },
+    {   -9,     255, 0x00f, 0x001ff0 },
+    {    3,     511, 0x007, 0x003ff0 },
+    {   -9,    -513, 0x00f, 0x003ff0 },
+    {    3,   -1025, 0x007, 0x007ff0 },
+    {   -9,    1023, 0x00f, 0x007ff0 },
+    {    3,    2047, 0x007, 0x00fff0 },
+    {   -9,   -2049, 0x00f, 0x00fff0 },
+    {    3,   -4097, 0x007, 0x01fff0 },
+    {   -9,    4095, 0x00f, 0x01fff0 },
+    {    3,    8191, 0x007, 0x03fff0 },
+    {   -9,   -8193, 0x00f, 0x03fff0 },
+    {    3,  -16385, 0x007, 0x07fff0 },
+    {   -9,   16383, 0x00f, 0x07fff0 },
+    {    3,   32767, 0x007, 0x0ffff0 },
+    {   -9,  -32769, 0x00f, 0x0ffff0 },
+    {    3,  -65537, 0x007, 0x1ffff0 },
+    {   -9,   65535, 0x00f, 0x1ffff0 },
+};
 
 static int automatic_corner(uint64_t iteration, int *rx_out, int *rz_out)
 {
-    const uint64_t max_region = (uint64_t)(INT_MAX / 32);
-    const uint64_t sig_count = automatic_signature_count();
-    const uint64_t capacity = automatic_corner_capacity();
-    if (sig_count == 0 || iteration >= capacity)
+    if (iteration >= AUTO_STATE_COUNT)
         return 0;
 
-    // Find the round containing this iteration.  At round r, every signature
-    // with capacity > r contributes exactly one corner.
-    uint64_t lo = 0;
-    uint64_t hi = 1;
-    while (hi < capacity && automatic_count_before_round(hi, sig_count) <= iteration) {
-        if (hi > UINT64_MAX / 2)
-            break;
-        hi *= 2;
-    }
-    if (hi > capacity)
-        hi = capacity;
-
-    while (lo < hi) {
-        const uint64_t mid = lo + (hi - lo) / 2;
-        if (automatic_count_before_round(mid, sig_count) <= iteration)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-
-    const uint64_t round = lo == 0 ? 0 : lo - 1;
-    const uint64_t before = automatic_count_before_round(round, sig_count);
-    uint64_t pos = iteration - before;
-
-    uint64_t sig = 0;
-    for (; sig < sig_count; ++sig) {
-        if (automatic_signature_capacity(sig) > round) {
-            if (pos == 0)
-                break;
-            --pos;
-        }
-    }
-    if (sig >= sig_count)
-        return 0;
-
-    const uint64_t trail = AUTO_RZ_MIN_TRAIL + sig / 2;
-    const uint64_t rx_base = (sig & 1) ? AUTO_RX_3TRAIL : AUTO_RX_2TRAIL;
-    const uint64_t rx_step = (rx_base == AUTO_RX_2TRAIL) ? 8 : 16;
-    const uint64_t rz_base = (UINT64_C(1) << trail) - 1;
-    const uint64_t rz_step = UINT64_C(1) << (trail + 1);
-    const uint64_t rx_count = (max_region - rx_base) / rx_step + 1;
-
-    const uint64_t rx_index = round % rx_count;
-    const uint64_t rz_index = round / rx_count;
-    const uint64_t rx = rx_base + rx_index * rx_step;
-    const uint64_t rz = rz_base + rz_index * rz_step;
-
-    if (rx > max_region || rz > max_region)
-        return 0;
-
-    *rx_out = (int)rx;
-    *rz_out = (int)rz;
+    const AutoRegionState *st = &g_auto_states[iteration];
+    *rx_out = st->rx;
+    *rz_out = st->rz;
     return 1;
+}
+
+static void print_auto_states(void)
+{
+    for (uint64_t i = 0; i < AUTO_STATE_COUNT; ++i) {
+        const AutoRegionState *st = &g_auto_states[i];
+        printf("  %2" PRIu64 ": corner=(%d,%d) deltas={0,0x%03" PRIx32 ",0x%06" PRIx32 ",0x%06" PRIx32 "}\n",
+               i + 1,
+               st->rx,
+               st->rz,
+               st->dx,
+               st->dz,
+               st->dx ^ st->dz);
+    }
 }
 
 static void handle_sigint(int signal_number)
@@ -311,6 +236,15 @@ typedef struct {
     int total_pieces;
     RegionDetail region[REGION_COUNT];
 } SearchResult;
+
+// This is the small, objective-facing view of a candidate.  The MITM/search
+// machinery never needs to know why a candidate is considered better; it only
+// produces these values.
+typedef struct {
+    int total_pieces;
+    int four_piece_count;
+    uint64_t world_seed;
+} ObjectiveKey;
 
 typedef struct {
     uint64_t world_seed;
@@ -897,33 +831,75 @@ static void make_detailed_result(const CandidateSummary *sum, SearchResult *out)
         fill_region_detail(sum->world_seed, d, sum->chunk_x[d], sum->chunk_z[d], &out->region[d]);
 }
 
-static int summary_should_enter_top(const CandidateSummary *a, const SearchResult *b)
+// ----- Search objective / ranking -----
+//
+// IMPORTANT: this is deliberately the ONLY function that defines what
+// "better" means.  The MITM, LUT, fortress evaluation, multi-region loop, and
+// output code are search plumbing.  When the goal changes later, change this
+// comparator (and, only if needed, add the required value to ObjectiveKey).
+//
+// Return >0 when a is better than b, <0 when b is better than a, and 0 for a
+// tie.  The current/debug objective is:
+//   1. maximize total fortress pieces across the four regions
+//   2. maximize four-piece count
+//   3. use the smaller world seed as a deterministic final tie-breaker
+static int objective_compare(const ObjectiveKey *a, const ObjectiveKey *b)
 {
     if (a->total_pieces != b->total_pieces)
-        return a->total_pieces > b->total_pieces;
+        return a->total_pieces > b->total_pieces ? 1 : -1;
     if (a->four_piece_count != b->four_piece_count)
-        return a->four_piece_count > b->four_piece_count;
-    return a->world_seed < b->world_seed;
+        return a->four_piece_count > b->four_piece_count ? 1 : -1;
+    if (a->world_seed != b->world_seed)
+        return a->world_seed < b->world_seed ? 1 : -1;
+    return 0;
 }
 
-static int result_equal_seed(const SearchResult *a, uint64_t ws)
+static ObjectiveKey objective_key_from_summary(const CandidateSummary *s)
 {
-    return a->world_seed == ws;
+    ObjectiveKey k;
+    k.total_pieces = s->total_pieces;
+    k.four_piece_count = s->four_piece_count;
+    k.world_seed = s->world_seed;
+    return k;
+}
+
+static ObjectiveKey objective_key_from_result(const SearchResult *r)
+{
+    ObjectiveKey k;
+    k.total_pieces = r->total_pieces;
+    k.four_piece_count = r->four_piece_count;
+    k.world_seed = r->world_seed;
+    return k;
+}
+
+// Same world seed at different region coordinates represents a different
+// discovered quad-fortress location, so it must not be deduplicated away in
+// automatic multi-region mode.
+static int result_same_location(const SearchResult *a, const SearchResult *b)
+{
+    return a->world_seed == b->world_seed &&
+           a->corner_rx == b->corner_rx &&
+           a->corner_rz == b->corner_rz;
+}
+
+static int summary_better_than(const CandidateSummary *cand, const SearchResult *worst)
+{
+    ObjectiveKey a = objective_key_from_summary(cand);
+    ObjectiveKey b = objective_key_from_result(worst);
+    return objective_compare(&a, &b) > 0;
 }
 
 static int result_better(const SearchResult *a, const SearchResult *b)
 {
-    if (a->total_pieces != b->total_pieces)
-        return a->total_pieces > b->total_pieces;
-    if (a->four_piece_count != b->four_piece_count)
-        return a->four_piece_count > b->four_piece_count;
-    return a->world_seed < b->world_seed;
+    ObjectiveKey ka = objective_key_from_result(a);
+    ObjectiveKey kb = objective_key_from_result(b);
+    return objective_compare(&ka, &kb) > 0;
 }
 
 static void top_insert(SearchResult *top, int *top_n, const SearchResult *cand)
 {
     for (int i = 0; i < *top_n; ++i) {
-        if (result_equal_seed(&top[i], cand->world_seed))
+        if (result_same_location(&top[i], cand))
             return;
     }
 
@@ -1022,7 +998,7 @@ static void evaluate_one_L(const LEntry *e, void *opaque)
     ++ctx->local_evals;
     atomic_fetch_add_explicit(&g_total_evals, 1, memory_order_relaxed);
 
-    if (ctx->top_n < TOP_N || summary_should_enter_top(&sum, &ctx->top[ctx->top_n - 1])) {
+    if (ctx->top_n < TOP_N || summary_better_than(&sum, &ctx->top[ctx->top_n - 1])) {
         SearchResult detailed;
         make_detailed_result(&sum, &detailed);
         top_insert(ctx->top, &ctx->top_n, &detailed);
@@ -1160,11 +1136,10 @@ static void print_usage(const char *argv0)
     printf("       %s [--lut-bits N] [--threads N] [--corner-rx N] [--corner-rz N]\n", argv0);
     printf("          [--pin D X Z]... [--no-pin] [--test]\n");
     printf("       %s N THREADS        (legacy positional form)\n\n", argv0);
-    printf("  --regions N         Run N automatic 2x2 region searches.  Corners are\n");
-    printf("                     unique; the first round covers every distinct RNG/feed-delta\n");
-    printf("                     signature, then later rounds continue with fresh coordinates.\n");
-    printf("                     There is no small fixed iteration limit; only the safe int\n");
-    printf("                     region-coordinate range limits the total number of corners.\n");
+    printf("  --regions N         Run the first N of the 24 precomputed, known-good automatic\n");
+    printf("                     RNG-delta states inside the +/-30,000,000 block world border.\n");
+    printf("                     N must be in [1,24]. No delta-signature discovery or\n");
+    printf("                     recalculation is performed in automatic mode.\n");
     printf("                     After all N searches, report the global top 10.\n");
     printf("  --lut-bits, -b N   Number of LOW bits placed in the MITM LUT [20..32].\n");
     printf("                     Larger N = larger RAM LUT, smaller H scan.\n");
@@ -1180,6 +1155,8 @@ static void print_usage(const char *argv0)
     printf("                     or -1 for any. Enforced inside the LUT. Default:\n");
     printf("                     --pin 0 0 0 --pin 1 7 0 --pin 2 0 7 --pin 3 7 7.\n");
     printf("  --no-pin           DEBUG: clear all offset pins (legacy behaviour).\n");
+    printf("  Objective ranking is isolated in objective_compare() near the SearchResult code.\n");
+    printf("  Change that one comparator to experiment with a different search goal.\n");
     printf("  --test             Measure MITM lookup time versus fortress evaluation time.\n");
     printf("                     Corner (0,0) gives deltas {0,1,16,17}; that corner's\n");
     printf("                     four-way nextInt(3)==0 filter is unsatisfiable, so it\n");
@@ -1194,15 +1171,25 @@ static void print_hex_seed(uint64_t x)
 
 static void print_result(const SearchResult *r, int rank)
 {
-    printf("#%d rngSeeds=0x%012" PRIx64 ",0x%012" PRIx64 ",0x%012" PRIx64 ",0x%012" PRIx64
-        " rx=%d rz=%d pieces=%d,%d,%d,%d total=%d\n",
+    const int rx = r->corner_rx;
+    const int rz = r->corner_rz;
+
+    printf("#%d worldSeed=0x%012" PRIx64
+        " corner=(%d,%d)"
+        " regionCoords=(%d,%d),(%d,%d),(%d,%d),(%d,%d)"
+        " rngSeeds=0x%012" PRIx64 ",0x%012" PRIx64 ",0x%012" PRIx64 ",0x%012" PRIx64
+        " pieces=%d,%d,%d,%d total=%d\n",
         rank,
+        r->world_seed,
+        rx, rz,
+        rx, rz,
+        rx + 1, rz,
+        rx, rz + 1,
+        rx + 1, rz + 1,
         r->region[0].rng_s0,
         r->region[1].rng_s0,
         r->region[2].rng_s0,
         r->region[3].rng_s0,
-        r->corner_rx,
-        r->corner_rz,
         r->region[0].piece_count,
         r->region[1].piece_count,
         r->region[2].piece_count,
@@ -1240,6 +1227,7 @@ int main(int argc, char **argv)
     int corner_rx = 0;
     int corner_rz = 1;
     uint64_t regions = 0;
+    int regions_flag_used = 0;
     int legacy_corner_used = 0;
     int legacy_pin_used = 0;
 
@@ -1256,6 +1244,7 @@ int main(int argc, char **argv)
             } else if (!strcmp(argv[i], "--regions")) {
                 if (++i >= argc || !parse_u64_arg(argv[i], &regions))
                     die("invalid --regions value");
+                regions_flag_used = 1;
             } else if (!strcmp(argv[i], "-b") || !strcmp(argv[i], "--lut-bits")) {
                 if (++i >= argc || !parse_int_arg(argv[i], &bits))
                     die("invalid --lut-bits value");
@@ -1309,9 +1298,8 @@ int main(int argc, char **argv)
 
     setup(bits);
 
-    uint64_t max_auto_regions = automatic_corner_capacity();
-    if (regions > 0 && regions > max_auto_regions)
-        die("--regions exceeds the safe automatic corner-coordinate capacity");
+    if (regions_flag_used && (regions < 1 || regions > AUTO_STATE_COUNT))
+        die("--regions must be between 1 and 24");
 
     long cpu_count = 16;
     if (cpu_count <= 0)
@@ -1325,12 +1313,11 @@ int main(int argc, char **argv)
     printf("LUT is built fully in RAM, then sorted in RAM; no on-disk table is used.\n");
 
     if (regions > 0) {
-        printf("Automatic region mode: %" PRIu64 " iterations requested.\n", regions);
-        printf("Automatic corners are unique; the first round uses every distinct RNG-delta signature,\n");
-        printf("then later rounds continue with fresh absolute corners while preserving valid trailing-one classes.\n");
-        printf("Distinct RNG-delta signatures available at b=%d: %" PRIu64 "\n",
-               bits, automatic_signature_count());
-        printf("Total safe unique automatic corners available: %" PRIu64 "\n", max_auto_regions);
+        printf("Automatic region mode: %" PRIu64 " of %d precomputed states requested.\n",
+               regions, AUTO_STATE_COUNT);
+        printf("These are fixed, known-good delta signatures with concrete corners inside the\n");
+        printf("+/-30,000,000 block world border; automatic mode performs no signature discovery.\n");
+        print_auto_states();
     } else {
         printf("Legacy single-corner mode: use --corner-rx/--corner-rz and pin flags for debugging.\n");
     }
